@@ -14,6 +14,7 @@ from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
 from streamvggt.utils.rotation import mat_to_quat
 
 
+
 def parse_args():
     p = argparse.ArgumentParser("StreamVGGT event-fusion inference")
     p.add_argument("--checkpoint", type=str, required=True)
@@ -38,14 +39,17 @@ def parse_args():
         metavar=("H", "W"),
         help="Fixed resize resolution (H W) before inference, should match training resolution policy.",
     )
+    
     return p.parse_args()
 
 
 def choose_dtype(mode: str, device: torch.device):
     if mode == "off" or device.type != "cuda":
         return None
+    
     if mode == "bf16":
         return torch.bfloat16
+    
     if mode == "fp16":
         return torch.float16
     # auto
