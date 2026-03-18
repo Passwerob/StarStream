@@ -402,13 +402,19 @@ def save_model(
     fname=None,
     best_so_far=None,
 ):
+    output_dir = Path(args.output_dir)
+    if fname is None:
+        fname = str(epoch)
+    checkpoint_path = output_dir / ("checkpoint-%s.pth" % fname)
+
+    # FSDP requires ALL ranks to call state_dict() so the internal
+    # _ALLGATHER_BASE collective can complete.  Only rank-0 will
+    # receive the full gathered tensor; other ranks get an empty dict.
+    model_state = model_without_ddp.state_dict()
+
     if accelerator.is_main_process:
-        output_dir = Path(args.output_dir)
-        if fname is None:
-            fname = str(epoch)
-        checkpoint_path = output_dir / ("checkpoint-%s.pth" % fname)
         to_save = {
-            "model": model_without_ddp.state_dict(),
+            "model": model_state,
             "optimizer": optimizer.state_dict(),
             "scaler": loss_scaler.state_dict(),
             "args": args,
@@ -420,11 +426,12 @@ def save_model(
         print(f">> Saving model to {checkpoint_path} ...")
         save_on_master(accelerator, to_save, checkpoint_path)
 
-        to_save = {
-            "model": model_without_ddp.state_dict(),
-        }
+        to_save = {"model": model_state}
         checkpoint_path = output_dir / ("model.pth")
         save_on_master(accelerator, to_save, checkpoint_path)
+
+    del model_state
+    accelerator.wait_for_everyone()
 
 
 def load_model(args, model_without_ddp, optimizer, loss_scaler):

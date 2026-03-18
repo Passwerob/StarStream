@@ -399,19 +399,21 @@ def train(args):
 def save_final_model(accelerator, args, epoch, model_without_ddp, best_so_far=None):
     output_dir = Path(args.output_dir)
     checkpoint_path = output_dir / "checkpoint-final.pth"
+    # All ranks must participate in state_dict() for FSDP all_gather
+    if isinstance(model_without_ddp, dict):
+        model_state = model_without_ddp
+    else:
+        model_state = model_without_ddp.state_dict()
     to_save = {
         "args": args,
-        "model": (
-            model_without_ddp
-            if isinstance(model_without_ddp, dict)
-            else model_without_ddp.cpu().state_dict()
-        ),
+        "model": model_state,
         "epoch": epoch,
     }
     if best_so_far is not None:
         to_save["best_so_far"] = best_so_far
     printer.info(f">> Saving model to {checkpoint_path} ...")
     misc.save_on_master(accelerator, to_save, checkpoint_path)
+    accelerator.wait_for_everyone()
 
 
 def build_dataset(
