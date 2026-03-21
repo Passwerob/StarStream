@@ -23,6 +23,12 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch import inf
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    StateDictType,
+    FullStateDictConfig,
+    FullOptimStateDictConfig,
+)
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 
@@ -298,16 +304,18 @@ class NativeScalerWithGradNormCount:
     ):
         self.accelerator.backward(
             loss, create_graph=create_graph
-        )  # .backward(create_graph=create_graph)
+        )
         if update_grad:
             if clip_grad is not None:
                 assert parameters is not None
-                # self._scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
                 norm = self.accelerator.clip_grad_norm_(parameters, clip_grad)
             else:
                 if self.accelerator.scaler is not None:
                     self.accelerator.unscale_gradients()
                 norm = get_grad_norm_(parameters)
+            if norm is not None and (torch.isnan(norm) or torch.isinf(norm)):
+                optimizer.zero_grad()
+                return norm
             optimizer.step()
         else:
             norm = None
@@ -407,15 +415,31 @@ def save_model(
         fname = str(epoch)
     checkpoint_path = output_dir / ("checkpoint-%s.pth" % fname)
 
-    # FSDP requires ALL ranks to call state_dict() so the internal
-    # _ALLGATHER_BASE collective can complete.  Only rank-0 will
-    # receive the full gathered tensor; other ranks get an empty dict.
-    model_state = model_without_ddp.state_dict()
+    is_fsdp = isinstance(model_without_ddp, FSDP)
+
+    if is_fsdp:
+        # Explicitly enter FULL_STATE_DICT mode so that FSDP performs the
+        # all_gather and rank-0 receives the complete, unflattened params.
+        # All ranks MUST enter this block together (collective operation).
+        sd_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        optim_cfg = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(
+            model_without_ddp,
+            StateDictType.FULL_STATE_DICT,
+            sd_cfg,
+            optim_cfg,
+        ):
+            model_state = model_without_ddp.state_dict()
+            raw_optim = getattr(optimizer, "optimizer", optimizer)
+            optim_state = FSDP.optim_state_dict(model_without_ddp, raw_optim)
+    else:
+        model_state = model_without_ddp.state_dict()
+        optim_state = optimizer.state_dict() if accelerator.is_main_process else None
 
     if accelerator.is_main_process:
         to_save = {
             "model": model_state,
-            "optimizer": optimizer.state_dict(),
+            "optimizer": optim_state,
             "scaler": loss_scaler.state_dict(),
             "args": args,
             "epoch": epoch,
@@ -430,7 +454,7 @@ def save_model(
         checkpoint_path = output_dir / ("model.pth")
         save_on_master(accelerator, to_save, checkpoint_path)
 
-    del model_state
+    del model_state, optim_state
     accelerator.wait_for_everyone()
 
 
@@ -448,7 +472,25 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler):
         printer.info("Resume checkpoint %s" % args.resume)
         state_dict = checkpoint["model"]
         new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-        model_without_ddp.load_state_dict(new_state_dict, strict=True)
+
+        empty_keys = [k for k, v in new_state_dict.items()
+                      if isinstance(v, torch.Tensor) and v.numel() == 0]
+        if empty_keys:
+            printer.warning(
+                "Checkpoint contains %d empty (numel=0) tensors "
+                "(likely a broken FSDP checkpoint). "
+                "Dropping these keys so the model keeps its initialised weights.",
+                len(empty_keys),
+            )
+            for k in empty_keys:
+                del new_state_dict[k]
+
+        info = model_without_ddp.load_state_dict(new_state_dict, strict=False)
+        if info.missing_keys:
+            printer.info("Missing keys when resuming: %s", info.missing_keys[:10])
+        if info.unexpected_keys:
+            printer.info("Unexpected keys when resuming: %s", info.unexpected_keys[:10])
+
         args.start_epoch = checkpoint["epoch"] + 1
         if "step" in checkpoint:
             args.start_step = checkpoint["step"]
@@ -456,12 +498,18 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler):
         printer.info(f"Moving optimizer state to device: {device}")
         
         if "optimizer" in checkpoint:
-            for state in checkpoint["optimizer"]["state"].values():
-                for k, v in state.items():
-                    if isinstance(v, torch.Tensor):
-                        state[k] = v.to(device)
-
-        optimizer.load_state_dict(checkpoint["optimizer"])
+            try:
+                for state in checkpoint["optimizer"]["state"].values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.to(device)
+                optimizer.load_state_dict(checkpoint["optimizer"])
+            except Exception as e:
+                printer.warning(
+                    "Failed to load optimizer state (likely saved with "
+                    "incompatible FSDP sharding): %s. "
+                    "Training will continue with a fresh optimizer.", e
+                )
 
         if "scaler" in checkpoint:
             loss_scaler.load_state_dict(checkpoint["scaler"])

@@ -216,10 +216,28 @@ def main():
                     output = model([view], None)
 
             pred = output.ress[0]
-            pts = pred["pts3d_in_other_view"][0].detach().cpu().numpy()
-            conf = pred["conf"][0].detach().cpu().numpy()
-            depth = pred["depth"][0].detach().cpu().numpy().squeeze(-1)
+            pts_raw = pred["pts3d_in_other_view"][0].detach().cpu()
+            conf_raw = pred["conf"][0].detach().cpu()
+            depth_raw = pred["depth"][0].detach().cpu()
             pose = pred["camera_pose"].unsqueeze(1)
+
+            n_pts_nan = int(torch.isnan(pts_raw).any(dim=-1).sum())
+            n_pts_inf = int(torch.isinf(pts_raw).any(dim=-1).sum())
+            n_depth_nan = int(torch.isnan(depth_raw).sum())
+            n_depth_inf = int(torch.isinf(depth_raw).sum())
+            n_conf_nan = int(torch.isnan(conf_raw).sum())
+            total_px = int(depth_raw.numel())
+            print(f"[DIAG] frame {idx}/{frame_name}: "
+                  f"pts NaN={n_pts_nan} Inf={n_pts_inf}, "
+                  f"depth NaN={n_depth_nan} Inf={n_depth_inf} (total={total_px}), "
+                  f"conf NaN={n_conf_nan}, "
+                  f"depth range=[{float(depth_raw.nanquantile(0.0) if n_depth_nan < total_px else 'nan')}, "
+                  f"{float(depth_raw.nanquantile(1.0) if n_depth_nan < total_px else 'nan')}], "
+                  f"conf range=[{float(conf_raw.min())}, {float(conf_raw.max())}]")
+
+            pts = pts_raw.numpy()
+            conf = conf_raw.numpy()
+            depth = depth_raw.numpy().squeeze(-1)
 
             H, W = depth.shape
             ext, intr = pose_encoding_to_extri_intri(pose, image_size_hw=(H, W))
@@ -234,10 +252,16 @@ def main():
             rgb_u8 = np.clip(input_rgb * 255.0, 0, 255).astype(np.uint8)
             Image.fromarray(rgb_u8).save(out / "images" / f"frame_{idx:06d}.png")
 
-            dmin = float(np.nanmin(depth))
-            dmax = float(np.nanmax(depth))
+            finite_mask = np.isfinite(depth)
+            if finite_mask.any():
+                dmin = float(np.min(depth[finite_mask]))
+                dmax = float(np.max(depth[finite_mask]))
+            else:
+                print(f"[WARN] frame {idx}: depth is entirely NaN/Inf, skipping depth visualization")
+                dmin, dmax = 0.0, 0.0
             np.save(out / "depth" / f"frame_{idx:06d}.npy", depth.astype(np.float32))
             dnorm = (depth - dmin) / (dmax - dmin) if dmax > dmin else np.zeros_like(depth, dtype=np.float32)
+            dnorm = np.where(np.isfinite(dnorm), dnorm, 0.0)
             d16 = np.clip(dnorm * 65535.0, 0, 65535).astype(np.uint16)
             cv2.imwrite(str(out / "depth" / f"frame_{idx:06d}.png"), d16)
             dvis = cv2.applyColorMap((dnorm * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
@@ -251,10 +275,14 @@ def main():
             xyz = pts.reshape(-1, 3)
             conf_flat = conf.reshape(-1)
             rgb_flat = rgb_u8.reshape(-1, 3)
-            keep = conf_flat >= args.conf_threshold
+            valid_geom = np.isfinite(xyz).all(axis=1) & np.isfinite(conf_flat)
+            keep = valid_geom & (conf_flat >= args.conf_threshold)
             xyz_k = xyz[keep]
             conf_k = conf_flat[keep]
             rgb_k = rgb_flat[keep]
+            if idx == 0 or keep.sum() == 0:
+                print(f"[DIAG] frame {idx}: valid_geom={valid_geom.sum()}/{len(valid_geom)}, "
+                      f"after conf_thr={keep.sum()}")
 
             save_ascii_ply(out / "point_cloud" / f"frame_{idx:06d}.ply", xyz_k, rgb_k, conf_k)
             merged_xyz.append(xyz_k)
