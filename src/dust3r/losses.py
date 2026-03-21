@@ -1128,16 +1128,15 @@ def normalize_pointcloud(pts3d, valid_mask, eps=1e-3):
     pts3d: B, H, W, 3
     valid_mask: B, H, W
     """
-    dist = pts3d.norm(dim=-1)
+    pts3d_safe = torch.nan_to_num(pts3d, nan=0.0, posinf=0.0, neginf=0.0)
+    dist = pts3d_safe.norm(dim=-1)
     dist_sum = (dist * valid_mask).sum(dim=[1,2])
     valid_count = valid_mask.sum(dim=[1,2])
 
     avg_scale = (dist_sum / (valid_count + eps)).clamp(min=eps, max=1e3)
 
-    # avg_scale = avg_scale.view(-1, 1, 1, 1, 1)
-
-    pts3d = pts3d / avg_scale.view(-1, 1, 1, 1)
-    return pts3d, avg_scale
+    pts3d_out = pts3d_safe / avg_scale.view(-1, 1, 1, 1)
+    return pts3d_out, avg_scale
 
 def point_map_to_normal(point_map, mask, eps=1e-6):
     """
@@ -1290,13 +1289,16 @@ class DepthOrPmapLoss(nn.Module):
         scale, shift = closed_form_scale_and_shift(
             pred_normalized, gt_normalized
         )
+        scale = scale.clamp(-1e3, 1e3)
+        shift = shift.clamp(-1e3, 1e3)
         pred_aligned = pred_normalized * scale + shift
+        pred_aligned = torch.nan_to_num(pred_aligned, nan=0.0, posinf=0.0, neginf=0.0)
         sigma_p = sigma_p.clamp(min=1e-6)
         if sigma_g is not None:
             sigma_g = sigma_g.clamp(min=1e-6)
-        #sigma = 0.5 * (sigma_p + sigma_g)
         sigma = sigma_p
         diff = (pred_aligned - gt_normalized).abs()
+        diff = diff.clamp(max=10.0)
 
         C = diff.shape[-1]
 
@@ -1310,8 +1312,8 @@ class DepthOrPmapLoss(nn.Module):
             grad_loss = self.gradient_loss_multi_scale(pred_aligned, gt_normalized, valid_mask)
         reg_sel = (-self.alpha * torch.log(sigma.clamp(min=1e-6)))[valid_mask]
         reg_loss = reg_sel.mean() if reg_sel.numel() > 0 else pred.new_zeros(())
-        # return main + reg
-        return self.gamma * main_loss + grad_loss + reg_loss
+        total = self.gamma * main_loss + grad_loss + reg_loss
+        return total.clamp(max=50.0)
 
 class TrackLoss(nn.Module):
     def __init__(self):
@@ -1469,7 +1471,13 @@ class DistillLoss(MultiLoss):
         else:
             Ltrack = torch.zeros_like(Lcamera)
 
+        Lcamera = torch.nan_to_num(Lcamera, nan=0.0, posinf=0.0, neginf=0.0)
+        Ldepth = torch.nan_to_num(Ldepth, nan=0.0, posinf=0.0, neginf=0.0)
+        Lpmap = torch.nan_to_num(Lpmap, nan=0.0, posinf=0.0, neginf=0.0)
+        Ltrack = torch.nan_to_num(Ltrack, nan=0.0, posinf=0.0, neginf=0.0)
+
         total = Lcamera * 20 + Ldepth * 20 + Lpmap * 10 + self.lambda_track * 10 * Ltrack
+        total = total.clamp(max=100.0)
         details = {}
 
         details['Lcamera'] = float(Lcamera) * 20

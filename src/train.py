@@ -397,13 +397,24 @@ def train(args):
 
 
 def save_final_model(accelerator, args, epoch, model_without_ddp, best_so_far=None):
+    from torch.distributed.fsdp import (
+        FullyShardedDataParallel as FSDP,
+        StateDictType,
+        FullStateDictConfig,
+    )
+
     output_dir = Path(args.output_dir)
     checkpoint_path = output_dir / "checkpoint-final.pth"
-    # All ranks must participate in state_dict() for FSDP all_gather
+
     if isinstance(model_without_ddp, dict):
         model_state = model_without_ddp
+    elif isinstance(model_without_ddp, FSDP):
+        sd_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model_without_ddp, StateDictType.FULL_STATE_DICT, sd_cfg):
+            model_state = model_without_ddp.state_dict()
     else:
         model_state = model_without_ddp.state_dict()
+
     to_save = {
         "args": args,
         "model": model_state,
@@ -464,11 +475,10 @@ def train_one_epoch(
     accum_iter = args.accum_iter
 
     def save_model(epoch, fname, best_so_far, data_iter_step):
-        unwrapped_model = accelerator.unwrap_model(model)
         misc.save_model(
             accelerator=accelerator,
             args=args,
-            model_without_ddp=unwrapped_model,
+            model_without_ddp=model,
             optimizer=optimizer,
             loss_scaler=loss_scaler,
             epoch=epoch,
@@ -572,14 +582,22 @@ def train_one_epoch(
                     )
                 optimizer.zero_grad()
                 continue
+
+            loss_clamped = loss.clamp(max=100.0)
+
             if not result.get("already_backprop", False):
-                loss_scaler(
-                    loss,
+                grad_norm = loss_scaler(
+                    loss_clamped,
                     optimizer,
                     parameters=model.parameters(),
                     update_grad=True,
                     clip_grad=1.0,
                 )
+                if grad_norm is not None and (torch.isnan(grad_norm) or torch.isinf(grad_norm)):
+                    if accelerator.is_main_process:
+                        printer.warning(
+                            f"NaN/Inf grad norm at step={step}, skipping update"
+                        )
                 optimizer.zero_grad()
 
             is_metric = batch[0]["is_metric"]
@@ -609,22 +627,18 @@ def train_one_epoch(
                     torch.tensor(loss_value).to(accelerator.device)
                 ).mean()  # MUST BE EXECUTED BY ALL NODES
 
-                if log_writer is None:
-                    continue
-                """ We use epoch_1000x as the x-axis in tensorboard.
-                This calibrates different curves when batch size changes.
-                """
-                epoch_1000x = int(epoch_f * 1000)
-                log_writer.add_scalar("train_loss", loss_value_reduce, step)
-                log_writer.add_scalar("train_lr", lr, step)
-                log_writer.add_scalar("train_iter", epoch_1000x, step)
-                for name, val in loss_details.items():
-                    if isinstance(val, torch.Tensor):
-                        if val.ndim > 0:
+                if log_writer is not None:
+                    epoch_1000x = int(epoch_f * 1000)
+                    log_writer.add_scalar("train_loss", loss_value_reduce, step)
+                    log_writer.add_scalar("train_lr", lr, step)
+                    log_writer.add_scalar("train_iter", epoch_1000x, step)
+                    for name, val in loss_details.items():
+                        if isinstance(val, torch.Tensor):
+                            if val.ndim > 0:
+                                continue
+                        if isinstance(val, dict):
                             continue
-                    if isinstance(val, dict):
-                        continue
-                    log_writer.add_scalar("train_" + name, val, step)
+                        log_writer.add_scalar("train_" + name, val, step)
 
         if (
             data_iter_step % int(args.save_freq * len(data_loader)) == 0
