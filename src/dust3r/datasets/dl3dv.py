@@ -332,6 +332,15 @@ class DL3DV_ScreenEvent_Multi(EasyDataset):
                     evt.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False
                 ).squeeze(0)
 
+            evt = torch.nan_to_num(evt, nan=0.0, posinf=0.0, neginf=0.0)
+            evt = evt.clamp(-50.0, 50.0)
+            evt_std = evt.std()
+            if evt_std < 1e-6:
+                evt = torch.zeros_like(evt)
+            else:
+                evt_mean = evt.mean()
+                evt = (evt - evt_mean) / evt_std
+
             views.append(
                 dict(
                     img=img_t,

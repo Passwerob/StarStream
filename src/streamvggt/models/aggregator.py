@@ -32,6 +32,7 @@ class EventPatchEmbed(nn.Module):
             kernel_size=patch_size,
             stride=patch_size,
         )
+        self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _, _, H, W = x.shape
@@ -41,6 +42,7 @@ class EventPatchEmbed(nn.Module):
             )
         x = self.proj(x)
         x = x.flatten(2).transpose(1, 2)
+        x = self.norm(x)
         return x
 
 
@@ -70,6 +72,7 @@ class CrossAttnFuse(nn.Module):
         q = self.norm_q(rgb_patch)
         kv = self.norm_kv(event_kv)
         attn_out, _ = self.attn(q, kv, kv)
+        attn_out = torch.nan_to_num(attn_out, nan=0.0, posinf=0.0, neginf=0.0)
         fused_patch = rgb_patch + attn_out
 
         if rgb_cls is not None:

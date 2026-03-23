@@ -1,0 +1,22 @@
+{
+  "checkpoint-2": {
+    "lpips": 0.11349269847075144,
+    "grad_error": 0.2606558859348297,
+    "edge_f1": 0.950612907892941,
+    "temporal_error": 0.08925190023621662,
+    "num_rgb_frames": 15,
+    "event_l1": 0.19139839440162745,
+    "event_correlation": -0.16495872037092213,
+    "event_polarity_agreement": 0.15696744402757143,
+    "num_event_pairs": 14
+  },
+  "mean": {
+    "lpips": 0.11349269847075144,
+    "grad_error": 0.2606558859348297,
+    "edge_f1": 0.950612907892941,
+    "temporal_error": 0.08925190023621662,
+    "event_l1": 0.19139839440162745,
+    "event_correlation": -0.16495872037092213,
+    "event_polarity_agreement": 0.15696744402757143
+  }
+}

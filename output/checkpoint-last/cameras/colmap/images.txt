@@ -1,0 +1,26 @@
+1 0.00000000 nan nan nan nan nan nan 1 000000.png
+
+2 0.00000000 nan nan nan nan nan nan 2 000001.png
+
+3 0.00000000 nan nan nan nan nan nan 3 000002.png
+
+4 0.00000000 nan nan nan nan nan nan 4 000003.png
+
+5 0.00000000 nan nan nan nan nan nan 5 000004.png
+
+6 0.00000000 nan nan nan nan nan nan 6 000005.png
+
+7 0.00000000 nan nan nan nan nan nan 7 000006.png
+
+8 0.00000000 nan nan nan nan nan nan 8 000007.png
+
+9 0.00000000 nan nan nan nan nan nan 9 000008.png
+
+10 0.00000000 nan nan nan nan nan nan 10 000009.png
+
+11 0.00000000 nan nan nan nan nan nan 11 000010.png
+
+12 0.00000000 nan nan nan nan nan nan 12 000011.png
+
+13 0.00000000 nan nan nan nan nan nan 13 000012.png
+

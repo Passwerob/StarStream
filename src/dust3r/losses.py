@@ -400,7 +400,7 @@ class Regr3DPose(Criterion, MultiLoss):
             valids = [valid & (dis <= dist_clip) for valid, dis in zip(valids, dis)]
 
         pr_pts_cross = [pred["pts3d_in_other_view"] for pred in preds]
-        conf_cross = [torch.log(pred["conf"]).detach().clip(eps) for pred in preds]
+        conf_cross = [torch.log(pred["conf"].clamp(min=eps)).detach() for pred in preds]
 
         # valids = torch.stack(valids, dim=0)  # S B H W
         # valids = valids.permute(1, 0, 2, 3)  # B S H W
@@ -529,8 +529,8 @@ class Regr3DPose(Criterion, MultiLoss):
 
         pr_pts_self = [pred["pts3d_in_self_view"] for pred in preds]
         pr_pts_cross = [pred["pts3d_in_other_view"] for pred in preds]
-        conf_self = [torch.log(pred["conf_self"]).detach().clip(eps) for pred in preds]
-        conf_cross = [torch.log(pred["conf"]).detach().clip(eps) for pred in preds]
+        conf_self = [torch.log(pred["conf_self"].clamp(min=eps)).detach() for pred in preds]
+        conf_cross = [torch.log(pred["conf"].clamp(min=eps)).detach() for pred in preds]
 
         if not self.norm_all:
             if self.max_metric_scale:
@@ -986,7 +986,8 @@ class ConfLoss(MultiLoss):
         return f"ConfLoss({self.pixel_loss})"
 
     def get_conf_log(self, x):
-        return x, torch.log(x)
+        x_safe = x.clamp(min=1e-6)
+        return x_safe, torch.log(x_safe)
 
     def compute_loss(self, gts, preds, **kw):
         # compute per-pixel loss
@@ -1087,17 +1088,18 @@ def closed_form_scale_and_shift(pred, gt):
     Args:
         pred:   (B, H, W, C) 
         gt:     (B, H, W, C) 
-        valid_mask: (B, H, W) 
     Returns:
-        scale:  (B,) 
-        shift:  (B,) 
+        scale:  (B,) or scalar
+        shift:  (B,) or (C,)
     """
     assert pred.dim() == 4 and gt.dim() == 4, "Inputs must be 4D tensors"
     B, H, W, C = pred.shape
-    device = pred.device
 
-    pred_flat = pred.view(-1, C)  # (N, C)
-    gt_flat = gt.view(-1, C)  # (N, C)
+    pred_safe = torch.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
+    gt_safe = torch.nan_to_num(gt, nan=0.0, posinf=0.0, neginf=0.0)
+
+    pred_flat = pred_safe.view(-1, C)
+    gt_flat = gt_safe.view(-1, C)
 
     if C == 1: 
         pred_mean = pred_flat.mean(dim=0)
@@ -1105,9 +1107,9 @@ def closed_form_scale_and_shift(pred, gt):
 
         numerator = ((pred_flat - pred_mean) * (gt_flat - gt_mean)).sum(dim=0)
         denominator = ((pred_flat - pred_mean) ** 2).sum(dim=0).clamp(min=1e-6)
-        scale = numerator / denominator
+        scale = (numerator / denominator).clamp(-1e3, 1e3)
 
-        shift = gt_mean - scale * pred_mean
+        shift = (gt_mean - scale * pred_mean).clamp(-1e3, 1e3)
         return scale, shift
 
     elif C == 3:
@@ -1116,8 +1118,8 @@ def closed_form_scale_and_shift(pred, gt):
         pred_centered = pred_flat - pred_mean
         gt_centered = gt_flat - gt_mean
 
-        scale = (pred_centered * gt_centered).sum() / (pred_centered ** 2).sum().clamp(min=1e-6)
-        shift = gt_mean - scale * pred_mean
+        scale = ((pred_centered * gt_centered).sum() / (pred_centered ** 2).sum().clamp(min=1e-6)).clamp(-1e3, 1e3)
+        shift = (gt_mean - scale * pred_mean).clamp(-1e3, 1e3)
         return scale, shift
 
     else:
@@ -1322,14 +1324,16 @@ class TrackLoss(nn.Module):
         self.alpha = 0.2
         self.gamma = 1.0
     def forward(self, y_pr, y_gt, vis_pr, vis_gt, w_p, w_g):
-        #w = 0.5 * (w_p + w_g)
         w = w_p
-        l_pos = (y_pr - y_gt).norm(dim=-1)
+        w = torch.nan_to_num(w, nan=0.0, posinf=1.0, neginf=0.0)
+        l_pos = (y_pr - y_gt).norm(dim=-1).clamp(max=50.0)
         l_pos = (w * l_pos).mean()
 
         l_vis = self.bce(vis_pr, vis_gt.float())
+        l_vis = torch.nan_to_num(l_vis, nan=0.0, posinf=0.0, neginf=0.0)
         l_vis = (w * l_vis).mean()
-        return l_pos + l_vis
+        total = l_pos + l_vis
+        return torch.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
 
 class FinetuneLoss(MultiLoss):
     def __init__(self, lambda_track=0.05):
@@ -1416,8 +1420,24 @@ class DistillLoss(MultiLoss):
 
     def get_name(self): return "DistillLoss"
 
+    @staticmethod
+    def _sanitize_teacher(t: dict) -> dict:
+        """Clamp & clean teacher pseudo-labels so NaN/Inf never reaches loss."""
+        for k in ("camera_pose", "depth", "depth_conf", "conf",
+                   "pts3d_in_other_view", "track", "vis", "track_conf"):
+            if k not in t:
+                continue
+            v = t[k]
+            if not torch.is_tensor(v):
+                continue
+            if not torch.isfinite(v).all():
+                t[k] = torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+        return t
+
     def compute_loss(self, gts, preds,
                      track_queries=None, track_preds=None):
+        gts = [self._sanitize_teacher(g) for g in gts]
+
         # ---------- Lcamera ----------
         cam_gt = torch.stack([g['camera_pose'] for g in gts], dim=1)
         cam_pr = torch.stack([p['camera_pose'] for p in preds], dim=1)
@@ -1466,7 +1486,6 @@ class DistillLoss(MultiLoss):
             w_p = torch.stack([p['track_conf'] for p in preds], dim=1)
             w_g = torch.stack([g['track_conf'] for g in gts], dim=1)
 
-
             Ltrack = self.track_loss(y_pr, y_gt, vis_pr, vis_gt, w_p, w_g)
         else:
             Ltrack = torch.zeros_like(Lcamera)
@@ -1477,7 +1496,7 @@ class DistillLoss(MultiLoss):
         Ltrack = torch.nan_to_num(Ltrack, nan=0.0, posinf=0.0, neginf=0.0)
 
         total = Lcamera * 20 + Ldepth * 20 + Lpmap * 10 + self.lambda_track * 10 * Ltrack
-        total = total.clamp(max=100.0)
+        total = total.clamp(max=50.0)
         details = {}
 
         details['Lcamera'] = float(Lcamera) * 20

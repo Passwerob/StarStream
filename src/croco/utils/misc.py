@@ -315,8 +315,12 @@ class NativeScalerWithGradNormCount:
                 norm = get_grad_norm_(parameters)
             if norm is not None and (torch.isnan(norm) or torch.isinf(norm)):
                 optimizer.zero_grad()
+                if self.accelerator.scaler is not None:
+                    self.accelerator.scaler.update()
                 return norm
             optimizer.step()
+            if self.accelerator.scaler is not None:
+                self.accelerator.scaler.update()
         else:
             norm = None
         return norm

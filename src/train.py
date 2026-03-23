@@ -212,10 +212,12 @@ def train(args):
     if args.pretrained and not args.resume:
         printer.info(f"Loading pretrained: {args.pretrained}")
         ckpt = torch.load(args.pretrained, map_location=device)
-        printer.info(
-            model.load_state_dict(ckpt, strict=True)
-        )
-        del ckpt  # in case it occupies memory
+        info = model.load_state_dict(ckpt, strict=False)
+        if info.missing_keys:
+            printer.info(f"Pretrained missing keys ({len(info.missing_keys)}): {info.missing_keys[:10]}")
+        if info.unexpected_keys:
+            printer.info(f"Pretrained unexpected keys ({len(info.unexpected_keys)}): {info.unexpected_keys[:10]}")
+        del ckpt
 
     printer.info("Loading teacher model")
     teacher_ckpt_path = getattr(args, "teacher", None) or args.pretrained
@@ -501,6 +503,8 @@ def train_one_epoch(
 
 
     optimizer.zero_grad()
+    train_one_epoch._nan_skip = 0
+    train_one_epoch._nonfinite_skip = 0
 
     start_step = args.start_step
 
@@ -554,17 +558,31 @@ def train_one_epoch(
             )
             all_finite = accelerator.gather(finite_flag).min().item() > 0.5
             if not all_finite:
+                nonfinite_skip = getattr(train_one_epoch, '_nonfinite_skip', 0) + 1
+                train_one_epoch._nonfinite_skip = nonfinite_skip
                 debug_views = []
                 if isinstance(batch, list):
                     for i, v in enumerate(batch):
                         if not isinstance(v, dict):
                             continue
+                        evt = v.get("event_voxel")
+                        evt_info = None
+                        if evt is not None and torch.is_tensor(evt):
+                            evt_info = {
+                                "shape": list(evt.shape),
+                                "has_nan": bool(torch.isnan(evt).any()),
+                                "has_inf": bool(torch.isinf(evt).any()),
+                                "min": float(evt.min()),
+                                "max": float(evt.max()),
+                                "std": float(evt.std()),
+                            }
                         debug_views.append(
                             {
                                 "i": i,
                                 "dataset": v.get("dataset"),
                                 "label": v.get("label"),
                                 "instance": v.get("instance"),
+                                "event_info": evt_info,
                             }
                         )
                 elif isinstance(batch, dict):
@@ -577,13 +595,23 @@ def train_one_epoch(
                     )
 
                 if accelerator.is_main_process:
+                    safe_details = {k: v for k, v in loss_details.items()
+                                    if isinstance(v, (int, float, str, bool))}
                     printer.error(
-                        f"Non-finite loss at step={step} data_iter_step={data_iter_step} loss={loss_value} details={loss_details} views={debug_views}"
+                        f"Non-finite loss at step={step} (total_skips={nonfinite_skip}) "
+                        f"loss={loss_value} details={safe_details} views={debug_views}"
                     )
+                if nonfinite_skip >= 100:
+                    if accelerator.is_main_process:
+                        printer.error(
+                            f"100 cumulative non-finite losses in this epoch — stopping epoch early"
+                        )
+                    optimizer.zero_grad()
+                    break
                 optimizer.zero_grad()
                 continue
 
-            loss_clamped = loss.clamp(max=100.0)
+            loss_clamped = loss.clamp(max=50.0)
 
             if not result.get("already_backprop", False):
                 grad_norm = loss_scaler(
@@ -594,10 +622,25 @@ def train_one_epoch(
                     clip_grad=1.0,
                 )
                 if grad_norm is not None and (torch.isnan(grad_norm) or torch.isinf(grad_norm)):
+                    nan_skip_counter = getattr(train_one_epoch, '_nan_skip', 0) + 1
+                    train_one_epoch._nan_skip = nan_skip_counter
                     if accelerator.is_main_process:
+                        safe_details = {k: v for k, v in loss_details.items()
+                                        if isinstance(v, (int, float, str, bool))}
                         printer.warning(
-                            f"NaN/Inf grad norm at step={step}, skipping update"
+                            f"NaN/Inf grad norm at step={step}, skipping update "
+                            f"(consecutive={nan_skip_counter}, loss={float(loss_clamped):.4f}, "
+                            f"details={safe_details})"
                         )
+                    if nan_skip_counter >= 50:
+                        if accelerator.is_main_process:
+                            printer.error(
+                                f"50 consecutive NaN grad norms — training is diverged, stopping epoch early"
+                            )
+                        optimizer.zero_grad()
+                        break
+                else:
+                    train_one_epoch._nan_skip = 0
                 optimizer.zero_grad()
 
             is_metric = batch[0]["is_metric"]

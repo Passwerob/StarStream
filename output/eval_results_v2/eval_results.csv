@@ -1,0 +1,3 @@
+sequence,edge_f1,event_corr,event_l1,grad_error,lpips_alex,num_event_pairs,num_rgb_frames,polarity_acc,temporal_error
+checkpoint-2,0.770324,-0.162907,0.866657,0.550945,0.113493,14,15,0.192027,0.089762
+mean,0.770324,-0.162907,0.866657,0.550945,0.113493,,,0.192027,0.089762
