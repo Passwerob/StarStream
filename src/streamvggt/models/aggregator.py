@@ -32,6 +32,7 @@ class EventPatchEmbed(nn.Module):
             kernel_size=patch_size,
             stride=patch_size,
         )
+        self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _, _, H, W = x.shape
@@ -41,7 +42,100 @@ class EventPatchEmbed(nn.Module):
             )
         x = self.proj(x)
         x = x.flatten(2).transpose(1, 2)
+        x = self.norm(x)
         return x
+
+
+class EventEncoder(nn.Module):
+    """
+    Enhanced event encoder: temporal bin mixing + multi-layer CNN stem.
+
+    Compared to EventPatchEmbed (single Conv2d), this provides:
+    - Explicit temporal modeling via pointwise MLP across event bins
+    - Richer spatial feature extraction via multi-layer CNN
+    - Total spatial stride = 2 * (patch_size // 2) = patch_size
+    """
+
+    def __init__(self, in_chans: int, embed_dim: int, patch_size: int):
+        super().__init__()
+        assert patch_size % 2 == 0, f"EventEncoder requires even patch_size, got {patch_size}"
+        self.patch_size = patch_size
+        mid = embed_dim // 4
+        mid2 = embed_dim // 2
+        second_stride = patch_size // 2
+
+        self.temporal_mix = nn.Sequential(
+            nn.Conv2d(in_chans, in_chans * 2, 1),
+            nn.GELU(),
+            nn.Conv2d(in_chans * 2, in_chans, 1),
+            nn.GELU(),
+        )
+
+        self.spatial_stem = nn.Sequential(
+            nn.Conv2d(in_chans, mid, 7, stride=2, padding=3),
+            nn.GELU(),
+            nn.GroupNorm(min(8, mid), mid),
+            nn.Conv2d(mid, mid2, 3, stride=1, padding=1),
+            nn.GELU(),
+            nn.GroupNorm(min(8, mid2), mid2),
+            nn.Conv2d(mid2, embed_dim, second_stride, stride=second_stride),
+        )
+
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _, _, H, W = x.shape
+        if H % self.patch_size != 0 or W % self.patch_size != 0:
+            raise ValueError(
+                f"EventEncoder expects H/W divisible by patch_size={self.patch_size}, got H={H}, W={W}"
+            )
+        x = x + self.temporal_mix(x)
+        x = self.spatial_stem(x)
+        x = x.flatten(2).transpose(1, 2)
+        x = self.norm(x)
+        return x
+
+
+class FSDPCrossAttention(nn.Module):
+    """FSDP-safe cross-attention using explicit nn.Linear modules.
+
+    ``nn.MultiheadAttention`` internally calls ``F.multi_head_attention_forward``
+    which accesses ``out_proj.weight`` as a raw tensor — bypassing the module's
+    ``forward()`` and therefore FSDP's unshard hook.  When size-based wrapping
+    individually wraps ``out_proj`` (>1 M params for embed_dim=1024), the weight
+    stays flat/1-D and the ``linear()`` call crashes.
+
+    This class replaces all functional paths with explicit ``nn.Linear`` calls
+    so every parameter is always properly unshard'd by FSDP.
+    """
+
+    def __init__(self, embed_dim: int, num_heads: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        assert embed_dim % num_heads == 0
+
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        B, Nq, C = query.shape
+        Nk = key.shape[1]
+
+        q = self.q_proj(query).reshape(B, Nq, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.k_proj(key).reshape(B, Nk, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.v_proj(value).reshape(B, Nk, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        attn_out = F.scaled_dot_product_attention(q, k, v)  # (B, H, Nq, D)
+        attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, Nq, C)
+        return self.out_proj(attn_out)
 
 
 class CrossAttnFuse(nn.Module):
@@ -49,7 +143,14 @@ class CrossAttnFuse(nn.Module):
         super().__init__()
         self.norm_q = nn.LayerNorm(embed_dim)
         self.norm_kv = nn.LayerNorm(embed_dim)
-        self.attn = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads, batch_first=True)
+        self.attn = FSDPCrossAttention(embed_dim=embed_dim, num_heads=num_heads)
+        self.gate_proj = nn.Sequential(
+            nn.LayerNorm(embed_dim * 2),
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.Tanh(),
+        )
+        nn.init.zeros_(self.gate_proj[1].weight)
+        nn.init.zeros_(self.gate_proj[1].bias)
 
     def forward(self, rgb_tokens: torch.Tensor, event_kv: torch.Tensor) -> torch.Tensor:
         if rgb_tokens.shape[1] == event_kv.shape[1] + 1:
@@ -69,14 +170,53 @@ class CrossAttnFuse(nn.Module):
 
         q = self.norm_q(rgb_patch)
         kv = self.norm_kv(event_kv)
-        attn_out, _ = self.attn(q, kv, kv)
-        fused_patch = rgb_patch + attn_out
+        attn_out = self.attn(q, kv, kv)
+        attn_out = torch.nan_to_num(attn_out, nan=0.0, posinf=0.0, neginf=0.0)
+        gate = self.gate_proj(torch.cat([rgb_patch, attn_out], dim=-1))
+        fused_patch = rgb_patch + gate * attn_out
 
         if rgb_cls is not None:
             fused_tokens = torch.cat([rgb_cls, fused_patch], dim=1)
         else:
             fused_tokens = fused_patch
         return fused_tokens
+
+
+class CrossAttnAdapter(nn.Module):
+    """
+    Zero-initialized cross-attention adapter for deep event injection.
+
+    Injects event information into backbone tokens at intermediate layers.
+    Double zero-init: global scalar `scale` (starts at 0) x per-token `gate`
+    (tanh with zero-init weights) ensures no disruption to pre-trained weights.
+    """
+
+    def __init__(self, embed_dim: int, num_heads: int):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(embed_dim)
+        self.norm_kv = nn.LayerNorm(embed_dim)
+        self.attn = FSDPCrossAttention(embed_dim=embed_dim, num_heads=num_heads)
+        self.scale = nn.Parameter(torch.zeros(1))
+        self.gate_proj = nn.Sequential(
+            nn.LayerNorm(embed_dim * 2),
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.Tanh(),
+        )
+        nn.init.zeros_(self.gate_proj[1].weight)
+        nn.init.zeros_(self.gate_proj[1].bias)
+
+    def forward(self, tokens: torch.Tensor, event_kv: torch.Tensor, patch_start_idx: int) -> torch.Tensor:
+        special = tokens[:, :patch_start_idx]
+        patch = tokens[:, patch_start_idx:]
+
+        q = self.norm_q(patch)
+        kv = self.norm_kv(event_kv)
+        attn_out = self.attn(q, kv, kv)
+        attn_out = torch.nan_to_num(attn_out, nan=0.0, posinf=0.0, neginf=0.0)
+
+        gate = self.gate_proj(torch.cat([patch, attn_out], dim=-1))
+        patch = patch + self.scale.tanh() * gate * attn_out
+        return torch.cat([special, patch], dim=1)
 
 
 class Aggregator(nn.Module):
@@ -128,6 +268,7 @@ class Aggregator(nn.Module):
         use_event=False,
         event_in_chans=8,
         event_patch_size=None,
+        inject_interval=0,
     ):
         super().__init__()
 
@@ -178,12 +319,13 @@ class Aggregator(nn.Module):
         self.fusion = fusion
         self.use_event = use_event
         self.event_patch_size = patch_size if event_patch_size is None else event_patch_size
+        self.inject_interval = inject_interval
 
         if self.fusion not in ["none", "crossattn"]:
             raise ValueError(f"Unsupported fusion mode: {self.fusion}")
 
         if self.fusion == "crossattn" or self.use_event:
-            self.event_patch_embed = EventPatchEmbed(
+            self.event_encoder = EventEncoder(
                 in_chans=event_in_chans,
                 embed_dim=embed_dim,
                 patch_size=self.event_patch_size,
@@ -194,9 +336,28 @@ class Aggregator(nn.Module):
             )
             self.cross_attn_fuse = CrossAttnFuse(embed_dim=embed_dim, num_heads=num_heads)
         else:
-            self.event_patch_embed = None
+            self.event_encoder = None
             self.event_proj = None
             self.cross_attn_fuse = None
+
+        # Deep multi-layer injection adapters
+        if self.inject_interval > 0 and (self.fusion == "crossattn" or self.use_event):
+            aa_block_num = depth // aa_block_size
+            num_adapters = aa_block_num // self.inject_interval
+            self.inject_adapters = nn.ModuleList(
+                [CrossAttnAdapter(embed_dim=embed_dim, num_heads=num_heads)
+                 for _ in range(num_adapters)]
+            )
+            self._inject_layer_indices = set(
+                (i + 1) * self.inject_interval - 1 for i in range(num_adapters)
+            )
+            logger.info(
+                "Deep injection: %d adapters at backbone iterations %s",
+                num_adapters, sorted(self._inject_layer_indices),
+            )
+        else:
+            self.inject_adapters = None
+            self._inject_layer_indices = set()
 
         # Validate that depth is divisible by aa_block_size
         if self.depth % self.aa_block_size != 0:
@@ -317,18 +478,19 @@ class Aggregator(nn.Module):
             patch_tokens = patch_tokens["x_norm_patchtokens"]
 
         rgb_tokens = patch_tokens
+        event_kv = None
 
         active_fusion = self.fusion if fusion is None else fusion
         active_use_event = self.use_event if use_event is None else use_event
         if active_fusion == "crossattn" and active_use_event and event_voxel is not None:
-            if self.event_patch_embed is None or self.event_proj is None or self.cross_attn_fuse is None:
+            if self.event_encoder is None or self.event_proj is None or self.cross_attn_fuse is None:
                 raise RuntimeError("Event fusion is requested but event modules are not initialized.")
             if event_voxel.shape[:2] != (B, S):
                 raise ValueError(
                     f"event_voxel shape mismatch with images: images={images_shape}, event_voxel={tuple(event_voxel.shape)}"
                 )
             event_voxel = event_voxel.reshape(B * S, event_voxel.shape[2], event_voxel.shape[3], event_voxel.shape[4])
-            event_tokens = self.event_patch_embed(event_voxel)
+            event_tokens = self.event_encoder(event_voxel)
             event_kv = self.event_proj(event_tokens)
             rgb_tokens = self.cross_attn_fuse(rgb_tokens, event_kv)
 
@@ -363,13 +525,31 @@ class Aggregator(nn.Module):
         frame_idx = 0
         global_idx = 0
         output_list = []
+        adapter_idx = 0
 
-        for _ in range(self.aa_block_num):
+        for block_iter in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
                         tokens, B, S, P, C, frame_idx, pos=pos
                     )
+                    # Deep injection: apply adapter after frame attention at scheduled layers
+                    if (event_kv is not None
+                            and self.inject_adapters is not None
+                            and block_iter in self._inject_layer_indices):
+                        if tokens.shape != (B * S, P, C):
+                            tokens = tokens.reshape(B, S, P, C).reshape(B * S, P, C)
+                        adapter = self.inject_adapters[adapter_idx]
+                        psi = self.patch_start_idx
+                        if self.gradient_checkpointing and self.training:
+                            def _adapter_fwd(_tok, _ekv, _a=adapter, _p=psi):
+                                return _a(_tok, _ekv, _p)
+                            tokens = checkpoint_utils.checkpoint(
+                                _adapter_fwd, tokens, event_kv, use_reentrant=False
+                            )
+                        else:
+                            tokens = adapter(tokens, event_kv, psi)
+                        adapter_idx += 1
                 elif attn_type == "global":
                     if use_cache:
                         if past_key_values[global_idx] is not None:

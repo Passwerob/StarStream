@@ -2,6 +2,9 @@ import os.path as osp
 import os
 import sys
 import itertools
+import json
+import hashlib
+import time
 
 import PIL.Image
 import numpy as np
@@ -205,6 +208,7 @@ class DL3DV_ScreenEvent_Multi(EasyDataset):
         max_interval=1,
         sample_mode="sequence",
         sequence_ratio=0.5,
+        exclude_keywords=None,
         **kwargs,
     ):
         self.ROOT = ROOT
@@ -216,6 +220,7 @@ class DL3DV_ScreenEvent_Multi(EasyDataset):
         self.max_interval = int(max_interval)
         self.sample_mode = str(sample_mode).lower()
         self.sequence_ratio = float(sequence_ratio)
+        self.exclude_keywords = [k.lower() for k in exclude_keywords] if exclude_keywords else []
         if self.sample_mode not in ("sequence", "random", "mixed"):
             raise ValueError(f"Invalid sample_mode={self.sample_mode}, expected one of ['sequence','random','mixed']")
         if not (0.0 <= self.sequence_ratio <= 1.0):
@@ -243,11 +248,35 @@ class DL3DV_ScreenEvent_Multi(EasyDataset):
                 width, height = resolution
             self._resolutions.append((int(width), int(height)))
 
+    def _cache_path(self):
+        key = json.dumps({
+            "root": self.ROOT,
+            "exclude": self.exclude_keywords,
+        }, sort_keys=True)
+        h = hashlib.md5(key.encode()).hexdigest()[:12]
+        return osp.join(self.ROOT, f".seq_index_cache_{h}.json")
+
     def _index_sequences(self):
+        cache_file = self._cache_path()
+        if osp.isfile(cache_file):
+            try:
+                with open(cache_file, "r") as f:
+                    cached = json.load(f)
+                seqs = [(e["name"], e["img_dir"], e["evt_dir"], e["stems"]) for e in cached]
+                print(f"[DL3DV_ScreenEvent_Multi] Loaded {len(seqs)} sequences from cache {cache_file}")
+                return seqs
+            except Exception as exc:
+                print(f"[DL3DV_ScreenEvent_Multi] Cache read failed ({exc}), re-scanning...")
+
+        t0 = time.time()
         seqs = []
+        n_excluded = 0
         for name in sorted(os.listdir(self.ROOT)):
             seq_dir = osp.join(self.ROOT, name)
             if not osp.isdir(seq_dir):
+                continue
+            if self.exclude_keywords and any(kw in name.lower() for kw in self.exclude_keywords):
+                n_excluded += 1
                 continue
             img_dir = osp.join(seq_dir, "images")
             evt_dir = osp.join(seq_dir, "events")
@@ -259,6 +288,21 @@ class DL3DV_ScreenEvent_Multi(EasyDataset):
             if len(stems) < 4:
                 continue
             seqs.append((name, img_dir, evt_dir, stems))
+
+        elapsed = time.time() - t0
+        if n_excluded > 0:
+            print(f"[DL3DV_ScreenEvent_Multi] Excluded {n_excluded} scenes "
+                  f"matching keywords {self.exclude_keywords}, kept {len(seqs)} scenes")
+        print(f"[DL3DV_ScreenEvent_Multi] Indexed {len(seqs)} sequences in {elapsed:.1f}s from {self.ROOT}")
+
+        try:
+            to_save = [{"name": s[0], "img_dir": s[1], "evt_dir": s[2], "stems": s[3]} for s in seqs]
+            with open(cache_file, "w") as f:
+                json.dump(to_save, f)
+            print(f"[DL3DV_ScreenEvent_Multi] Saved index cache to {cache_file}")
+        except Exception as exc:
+            print(f"[DL3DV_ScreenEvent_Multi] Warning: failed to save cache ({exc})")
+
         return seqs
 
     def __len__(self):
@@ -332,10 +376,22 @@ class DL3DV_ScreenEvent_Multi(EasyDataset):
                     evt.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False
                 ).squeeze(0)
 
+            evt = torch.nan_to_num(evt, nan=0.0, posinf=0.0, neginf=0.0)
+            evt = evt.clamp(-50.0, 50.0)
+            evt_std = evt.std()
+            if evt_std < 1e-6:
+                evt = torch.zeros_like(evt)
+            else:
+                evt_mean = evt.mean()
+                evt = (evt - evt_mean) / evt_std
+
+            valid_mask = np.ones((H, W), dtype=bool)
+
             views.append(
                 dict(
                     img=img_t,
                     event_voxel=evt,
+                    valid_mask=valid_mask,
                     dataset="dl3dv",
                     label=f"{seq_name}/{stem}",
                     instance=img_path,

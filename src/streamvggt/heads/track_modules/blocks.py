@@ -88,9 +88,21 @@ class EfficientUpdateFormer(nn.Module):
 
         self.apply(_basic_init)
 
+    @staticmethod
+    def _safe_layer_norm(module, x):
+        """LayerNorm in float32 then cast to the module's weight dtype."""
+        out = F.layer_norm(
+            x.float(),
+            module.normalized_shape,
+            module.weight.float() if module.weight is not None else None,
+            module.bias.float() if module.bias is not None else None,
+            module.eps,
+        )
+        target = module.weight.dtype if module.weight is not None else x.dtype
+        return out.to(target)
+
     def forward(self, input_tensor, mask=None):
-        # Apply input LayerNorm
-        input_tensor = self.input_norm(input_tensor)
+        input_tensor = self._safe_layer_norm(self.input_norm, input_tensor)
         tokens = self.input_transform(input_tensor)
 
         init_tokens = tokens
@@ -128,8 +140,7 @@ class EfficientUpdateFormer(nn.Module):
 
         tokens = tokens + init_tokens
 
-        # Apply output LayerNorm before final projection
-        tokens = self.output_norm(tokens)
+        tokens = self._safe_layer_norm(self.output_norm, tokens)
         flow = self.flow_head(tokens)
 
         return flow, None

@@ -12,8 +12,8 @@ FRAME_NUM="$2"
 PORT="${3:-8001}"
 
 DATA_ROOT="/share/magic_group/aigc/fcr/EventVGGT/data/DL3DV_data/DL3DV/screen-000167"
-SRC_DIR="/share/magic_group/aigc/fcr/EventVGGT/data/StreamVGGT_mixed_FSDP/src"
-OUT_BASE="/share/magic_group/aigc/fcr/EventVGGT/data/StreamVGGT_mixed_FSDP/output"
+SRC_DIR="/share/magic_group/aigc/fcr/EventVGGT/data/StreamVGGT_mixed_FSDP_inject/src"
+OUT_BASE="/share/magic_group/aigc/fcr/EventVGGT/data/StreamVGGT_mixed_FSDP_inject/output"
 
 if [[ ! -f "$CKPT_PATH" ]]; then
   echo "[ERROR] checkpoint不存在: $CKPT_PATH"

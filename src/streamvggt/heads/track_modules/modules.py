@@ -137,6 +137,19 @@ class Mlp(nn.Module):
         return x
 
 
+def _safe_layer_norm(module, x):
+    """LayerNorm in float32 then cast to the module's weight dtype."""
+    out = F.layer_norm(
+        x.float(),
+        module.normalized_shape,
+        module.weight.float() if module.weight is not None else None,
+        module.bias.float() if module.bias is not None else None,
+        module.eps,
+    )
+    target = module.weight.dtype if module.weight is not None else x.dtype
+    return out.to(target)
+
+
 class AttnBlock(nn.Module):
     def __init__(
         self,
@@ -161,19 +174,12 @@ class AttnBlock(nn.Module):
         self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, drop=0)
 
     def forward(self, x, mask=None):
-        # Prepare the mask for PyTorch's attention (it expects a different format)
-        # attn_mask = mask if mask is not None else None
-        # Normalize before attention
-        x = self.norm1(x)
-
-        # PyTorch's MultiheadAttention returns attn_output, attn_output_weights
-        # attn_output, _ = self.attn(x, x, x, attn_mask=attn_mask)
+        x = _safe_layer_norm(self.norm1, x)
 
         attn_output, _ = self.attn(x, x, x)
 
-        # Add & Norm
         x = x + attn_output
-        x = x + self.mlp(self.norm2(x))
+        x = x + self.mlp(_safe_layer_norm(self.norm2, x))
         return x
 
 
@@ -197,15 +203,11 @@ class CrossAttnBlock(nn.Module):
         self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, drop=0)
 
     def forward(self, x, context, mask=None):
-        # Normalize inputs
-        x = self.norm1(x)
-        context = self.norm_context(context)
+        x = _safe_layer_norm(self.norm1, x)
+        context = _safe_layer_norm(self.norm_context, context)
 
-        # Apply cross attention
-        # Note: nn.MultiheadAttention returns attn_output, attn_output_weights
         attn_output, _ = self.cross_attn(x, context, context, attn_mask=mask)
 
-        # Add & Norm
         x = x + attn_output
-        x = x + self.mlp(self.norm2(x))
+        x = x + self.mlp(_safe_layer_norm(self.norm2, x))
         return x

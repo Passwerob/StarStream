@@ -1,11 +1,34 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange, repeat
 
 
 from .blocks import EfficientUpdateFormer, CorrBlock
 from .utils import sample_features4d, get_2d_embedding, get_2d_sincos_pos_embed
 from .modules import Mlp
+
+
+def _safe_norm(module, x):
+    """Norm in float32 then cast to the module's weight dtype."""
+    target = module.weight.dtype if module.weight is not None else x.dtype
+    if isinstance(module, nn.LayerNorm):
+        return F.layer_norm(
+            x.float(),
+            module.normalized_shape,
+            module.weight.float() if module.weight is not None else None,
+            module.bias.float() if module.bias is not None else None,
+            module.eps,
+        ).to(target)
+    elif isinstance(module, nn.GroupNorm):
+        return F.group_norm(
+            x.float(),
+            module.num_groups,
+            module.weight.float() if module.weight is not None else None,
+            module.bias.float() if module.bias is not None else None,
+            module.eps,
+        ).to(target)
+    return module(x)
 
 
 class BaseTrackerPredictor(nn.Module):
@@ -77,8 +100,7 @@ class BaseTrackerPredictor(nn.Module):
 
         assert D == 2, "Input points must be 2D coordinates"
 
-        # apply a layernorm to fmaps here
-        fmaps = self.fmap_norm(fmaps.permute(0, 1, 3, 4, 2))
+        fmaps = _safe_norm(self.fmap_norm, fmaps.permute(0, 1, 3, 4, 2))
         fmaps = fmaps.permute(0, 1, 4, 2, 3)
 
         # Scale the input query_points because we may downsample the images
@@ -160,7 +182,7 @@ class BaseTrackerPredictor(nn.Module):
             delta_feats_ = delta_feats_.reshape(B * N * S, self.latent_dim)
 
             # Update the track features
-            track_feats_ = self.ffeat_updater(self.ffeat_norm(delta_feats_)) + track_feats_
+            track_feats_ = self.ffeat_updater(_safe_norm(self.ffeat_norm, delta_feats_)) + track_feats_
 
             track_feats = track_feats_.reshape(B, N, S, self.latent_dim).permute(0, 2, 1, 3)  # BxSxNxC
 

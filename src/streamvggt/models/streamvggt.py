@@ -25,6 +25,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         use_event=False,
         event_in_chans=8,
         event_patch_size=None,
+        inject_interval=0,
     ):
         super().__init__()
 
@@ -36,6 +37,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
             use_event=use_event,
             event_in_chans=event_in_chans,
             event_patch_size=event_patch_size,
+            inject_interval=inject_interval,
         )
         self.camera_head = CameraHead(dim_in=2 * embed_dim)
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1")
@@ -122,14 +124,10 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 predictions["world_points_conf"] = pts3d_conf
 
             if self.track_head is not None and query_points is not None:
-                track_param = next(self.track_head.parameters(), None)
-                track_dtype = track_param.dtype if track_param is not None else aggregated_tokens_list[0].dtype
-                track_tokens = [x.to(dtype=track_dtype) for x in aggregated_tokens_list]
-                track_images = images.to(dtype=track_dtype)
                 track_list, vis, conf = self.track_head(
-                    track_tokens, images=track_images, patch_start_idx=patch_start_idx, query_points=query_points
+                    aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx, query_points=query_points
                 )
-                predictions["track"] = track_list[-1]  # track of the last iteration
+                predictions["track"] = track_list[-1]
                 predictions["vis"] = vis
                 predictions["conf"] = conf
             predictions["images"] = images
@@ -223,13 +221,9 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     pts3d_conf = pts3d_conf[:, 0]
 
                 if self.track_head is not None and query_points is not None:
-                    track_param = next(self.track_head.parameters(), None)
-                    track_dtype = track_param.dtype if track_param is not None else aggregated_tokens[0].dtype
-                    track_tokens = [x.to(dtype=track_dtype) for x in aggregated_tokens]
-                    track_images = images.to(dtype=track_dtype)
                     track_list, vis, conf = self.track_head(
-                        track_tokens, images=track_images, patch_start_idx=patch_start_idx, query_points=query_points
-                )
+                        aggregated_tokens, images=images, patch_start_idx=patch_start_idx, query_points=query_points
+                    )
                     track = track_list[-1][:, 0]  
                     query_points = track
                     vis = vis[:, 0]

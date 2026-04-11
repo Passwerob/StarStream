@@ -400,7 +400,7 @@ class Regr3DPose(Criterion, MultiLoss):
             valids = [valid & (dis <= dist_clip) for valid, dis in zip(valids, dis)]
 
         pr_pts_cross = [pred["pts3d_in_other_view"] for pred in preds]
-        conf_cross = [torch.log(pred["conf"]).detach().clip(eps) for pred in preds]
+        conf_cross = [torch.log(pred["conf"].clamp(min=eps)).detach() for pred in preds]
 
         # valids = torch.stack(valids, dim=0)  # S B H W
         # valids = valids.permute(1, 0, 2, 3)  # B S H W
@@ -529,8 +529,8 @@ class Regr3DPose(Criterion, MultiLoss):
 
         pr_pts_self = [pred["pts3d_in_self_view"] for pred in preds]
         pr_pts_cross = [pred["pts3d_in_other_view"] for pred in preds]
-        conf_self = [torch.log(pred["conf_self"]).detach().clip(eps) for pred in preds]
-        conf_cross = [torch.log(pred["conf"]).detach().clip(eps) for pred in preds]
+        conf_self = [torch.log(pred["conf_self"].clamp(min=eps)).detach() for pred in preds]
+        conf_cross = [torch.log(pred["conf"].clamp(min=eps)).detach() for pred in preds]
 
         if not self.norm_all:
             if self.max_metric_scale:
@@ -986,7 +986,8 @@ class ConfLoss(MultiLoss):
         return f"ConfLoss({self.pixel_loss})"
 
     def get_conf_log(self, x):
-        return x, torch.log(x)
+        x_safe = x.clamp(min=1e-6)
+        return x_safe, torch.log(x_safe)
 
     def compute_loss(self, gts, preds, **kw):
         # compute per-pixel loss
@@ -1087,17 +1088,18 @@ def closed_form_scale_and_shift(pred, gt):
     Args:
         pred:   (B, H, W, C) 
         gt:     (B, H, W, C) 
-        valid_mask: (B, H, W) 
     Returns:
-        scale:  (B,) 
-        shift:  (B,) 
+        scale:  (B,) or scalar
+        shift:  (B,) or (C,)
     """
     assert pred.dim() == 4 and gt.dim() == 4, "Inputs must be 4D tensors"
     B, H, W, C = pred.shape
-    device = pred.device
 
-    pred_flat = pred.view(-1, C)  # (N, C)
-    gt_flat = gt.view(-1, C)  # (N, C)
+    pred_safe = torch.nan_to_num(pred, nan=0.0, posinf=0.0, neginf=0.0)
+    gt_safe = torch.nan_to_num(gt, nan=0.0, posinf=0.0, neginf=0.0)
+
+    pred_flat = pred_safe.view(-1, C)
+    gt_flat = gt_safe.view(-1, C)
 
     if C == 1: 
         pred_mean = pred_flat.mean(dim=0)
@@ -1105,9 +1107,9 @@ def closed_form_scale_and_shift(pred, gt):
 
         numerator = ((pred_flat - pred_mean) * (gt_flat - gt_mean)).sum(dim=0)
         denominator = ((pred_flat - pred_mean) ** 2).sum(dim=0).clamp(min=1e-6)
-        scale = numerator / denominator
+        scale = (numerator / denominator).clamp(-1e3, 1e3)
 
-        shift = gt_mean - scale * pred_mean
+        shift = (gt_mean - scale * pred_mean).clamp(-1e3, 1e3)
         return scale, shift
 
     elif C == 3:
@@ -1116,8 +1118,8 @@ def closed_form_scale_and_shift(pred, gt):
         pred_centered = pred_flat - pred_mean
         gt_centered = gt_flat - gt_mean
 
-        scale = (pred_centered * gt_centered).sum() / (pred_centered ** 2).sum().clamp(min=1e-6)
-        shift = gt_mean - scale * pred_mean
+        scale = ((pred_centered * gt_centered).sum() / (pred_centered ** 2).sum().clamp(min=1e-6)).clamp(-1e3, 1e3)
+        shift = (gt_mean - scale * pred_mean).clamp(-1e3, 1e3)
         return scale, shift
 
     else:
@@ -1128,16 +1130,15 @@ def normalize_pointcloud(pts3d, valid_mask, eps=1e-3):
     pts3d: B, H, W, 3
     valid_mask: B, H, W
     """
-    dist = pts3d.norm(dim=-1)
+    pts3d_safe = torch.nan_to_num(pts3d, nan=0.0, posinf=0.0, neginf=0.0)
+    dist = pts3d_safe.norm(dim=-1)
     dist_sum = (dist * valid_mask).sum(dim=[1,2])
     valid_count = valid_mask.sum(dim=[1,2])
 
     avg_scale = (dist_sum / (valid_count + eps)).clamp(min=eps, max=1e3)
 
-    # avg_scale = avg_scale.view(-1, 1, 1, 1, 1)
-
-    pts3d = pts3d / avg_scale.view(-1, 1, 1, 1)
-    return pts3d, avg_scale
+    pts3d_out = pts3d_safe / avg_scale.view(-1, 1, 1, 1)
+    return pts3d_out, avg_scale
 
 def point_map_to_normal(point_map, mask, eps=1e-6):
     """
@@ -1189,16 +1190,25 @@ class CameraLoss(nn.Module):
     def __init__(self, delta=1e-1, weights=(1.0, 1.0, 0.5)):
         super().__init__()
         self.weights = weights
+
+    @staticmethod
+    def quat_angle_loss(q_pred, q_gt):
+        q_pred_n = F.normalize(q_pred, dim=-1)
+        q_gt_n = F.normalize(q_gt, dim=-1)
+        dot = (q_pred_n * q_gt_n).sum(dim=-1).abs()
+        dot = dot.clamp(max=1.0 - 1e-7)
+        angle = 2.0 * torch.acos(dot)
+        return angle
+
     def forward(self, pred_pose, gt_pose):
         loss_T = (pred_pose[..., :3] - gt_pose[..., :3]).abs()
-        loss_R = (pred_pose[..., 3:7] - gt_pose[..., 3:7]).abs()
+        loss_R = self.quat_angle_loss(pred_pose[..., 3:7], gt_pose[..., 3:7])
         loss_FL = (pred_pose[..., 7:] - gt_pose[..., 7:]).abs()
 
         loss_T = check_and_fix_inf_nan(loss_T, "loss_T")
         loss_R = check_and_fix_inf_nan(loss_R, "loss_R")
         loss_FL = check_and_fix_inf_nan(loss_FL, "loss_FL")
 
-        # Clamp outlier translation loss to prevent instability, then average
         loss_T = loss_T.clamp(max=100).mean()
         loss_R = loss_R.mean()
         loss_FL = loss_FL.mean()
@@ -1290,11 +1300,13 @@ class DepthOrPmapLoss(nn.Module):
         scale, shift = closed_form_scale_and_shift(
             pred_normalized, gt_normalized
         )
+        scale = scale.clamp(-1e3, 1e3)
+        shift = shift.clamp(-1e3, 1e3)
         pred_aligned = pred_normalized * scale + shift
+        pred_aligned = torch.nan_to_num(pred_aligned, nan=0.0, posinf=0.0, neginf=0.0)
         sigma_p = sigma_p.clamp(min=1e-6)
         if sigma_g is not None:
             sigma_g = sigma_g.clamp(min=1e-6)
-        #sigma = 0.5 * (sigma_p + sigma_g)
         sigma = sigma_p
         diff = (pred_aligned - gt_normalized).abs()
 
@@ -1310,24 +1322,32 @@ class DepthOrPmapLoss(nn.Module):
             grad_loss = self.gradient_loss_multi_scale(pred_aligned, gt_normalized, valid_mask)
         reg_sel = (-self.alpha * torch.log(sigma.clamp(min=1e-6)))[valid_mask]
         reg_loss = reg_sel.mean() if reg_sel.numel() > 0 else pred.new_zeros(())
-        # return main + reg
-        return self.gamma * main_loss + grad_loss + reg_loss
+        total = self.gamma * main_loss + grad_loss + reg_loss
+        return total
 
 class TrackLoss(nn.Module):
-    def __init__(self):
+    def __init__(self, conf_reg_alpha=0.1):
         super().__init__()
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
         self.alpha = 0.2
         self.gamma = 1.0
+        self.conf_reg_alpha = conf_reg_alpha
     def forward(self, y_pr, y_gt, vis_pr, vis_gt, w_p, w_g):
-        #w = 0.5 * (w_p + w_g)
         w = w_p
+        w = torch.nan_to_num(w, nan=0.0, posinf=1.0, neginf=0.0)
+        w = w.clamp(min=1e-6)
         l_pos = (y_pr - y_gt).norm(dim=-1)
         l_pos = (w * l_pos).mean()
 
         l_vis = self.bce(vis_pr, vis_gt.float())
+        l_vis = torch.nan_to_num(l_vis, nan=0.0, posinf=0.0, neginf=0.0)
         l_vis = (w * l_vis).mean()
-        return l_pos + l_vis
+
+        reg = -self.conf_reg_alpha * torch.log(w.clamp(min=1e-6))
+        reg = reg.mean()
+
+        total = l_pos + l_vis + reg
+        return torch.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
 
 class FinetuneLoss(MultiLoss):
     def __init__(self, lambda_track=0.05):
@@ -1414,8 +1434,24 @@ class DistillLoss(MultiLoss):
 
     def get_name(self): return "DistillLoss"
 
+    @staticmethod
+    def _sanitize_teacher(t: dict) -> dict:
+        """Clamp & clean teacher pseudo-labels so NaN/Inf never reaches loss."""
+        for k in ("camera_pose", "depth", "depth_conf", "conf",
+                   "pts3d_in_other_view", "track", "vis", "track_conf"):
+            if k not in t:
+                continue
+            v = t[k]
+            if not torch.is_tensor(v):
+                continue
+            if not torch.isfinite(v).all():
+                t[k] = torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+        return t
+
     def compute_loss(self, gts, preds,
                      track_queries=None, track_preds=None):
+        gts = [self._sanitize_teacher(g) for g in gts]
+
         # ---------- Lcamera ----------
         cam_gt = torch.stack([g['camera_pose'] for g in gts], dim=1)
         cam_pr = torch.stack([p['camera_pose'] for p in preds], dim=1)
@@ -1464,10 +1500,14 @@ class DistillLoss(MultiLoss):
             w_p = torch.stack([p['track_conf'] for p in preds], dim=1)
             w_g = torch.stack([g['track_conf'] for g in gts], dim=1)
 
-
             Ltrack = self.track_loss(y_pr, y_gt, vis_pr, vis_gt, w_p, w_g)
         else:
             Ltrack = torch.zeros_like(Lcamera)
+
+        Lcamera = torch.nan_to_num(Lcamera, nan=0.0, posinf=0.0, neginf=0.0)
+        Ldepth = torch.nan_to_num(Ldepth, nan=0.0, posinf=0.0, neginf=0.0)
+        Lpmap = torch.nan_to_num(Lpmap, nan=0.0, posinf=0.0, neginf=0.0)
+        Ltrack = torch.nan_to_num(Ltrack, nan=0.0, posinf=0.0, neginf=0.0)
 
         total = Lcamera * 20 + Ldepth * 20 + Lpmap * 10 + self.lambda_track * 10 * Ltrack
         details = {}

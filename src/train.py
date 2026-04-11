@@ -185,6 +185,7 @@ def train(args):
         use_event=bool(getattr(args, "use_event", False)),
         event_in_chans=int(getattr(args, "event_in_chans", 8)),
         event_patch_size=getattr(args, "event_patch_size", None),
+        inject_interval=int(getattr(args, "inject_interval", 0)),
     )
     teacher = VGGT()
 
@@ -212,10 +213,12 @@ def train(args):
     if args.pretrained and not args.resume:
         printer.info(f"Loading pretrained: {args.pretrained}")
         ckpt = torch.load(args.pretrained, map_location=device)
-        printer.info(
-            model.load_state_dict(ckpt, strict=True)
-        )
-        del ckpt  # in case it occupies memory
+        info = model.load_state_dict(ckpt, strict=False)
+        if info.missing_keys:
+            printer.info(f"Pretrained missing keys ({len(info.missing_keys)}): {info.missing_keys[:10]}")
+        if info.unexpected_keys:
+            printer.info(f"Pretrained unexpected keys ({len(info.unexpected_keys)}): {info.unexpected_keys[:10]}")
+        del ckpt
 
     printer.info("Loading teacher model")
     teacher_ckpt_path = getattr(args, "teacher", None) or args.pretrained
@@ -311,6 +314,8 @@ def train(args):
         optimizer, model, data_loader_train
     )
 
+    misc.load_optimizer_after_fsdp(model, optimizer)
+
     def write_log_stats(epoch, train_stats, test_stats):
         if accelerator.is_main_process:
             if log_writer is not None:
@@ -397,13 +402,24 @@ def train(args):
 
 
 def save_final_model(accelerator, args, epoch, model_without_ddp, best_so_far=None):
+    from torch.distributed.fsdp import (
+        FullyShardedDataParallel as FSDP,
+        StateDictType,
+        FullStateDictConfig,
+    )
+
     output_dir = Path(args.output_dir)
     checkpoint_path = output_dir / "checkpoint-final.pth"
-    # All ranks must participate in state_dict() for FSDP all_gather
+
     if isinstance(model_without_ddp, dict):
         model_state = model_without_ddp
+    elif isinstance(model_without_ddp, FSDP):
+        sd_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model_without_ddp, StateDictType.FULL_STATE_DICT, sd_cfg):
+            model_state = model_without_ddp.state_dict()
     else:
         model_state = model_without_ddp.state_dict()
+
     to_save = {
         "args": args,
         "model": model_state,
@@ -413,6 +429,11 @@ def save_final_model(accelerator, args, epoch, model_without_ddp, best_so_far=No
         to_save["best_so_far"] = best_so_far
     printer.info(f">> Saving model to {checkpoint_path} ...")
     misc.save_on_master(accelerator, to_save, checkpoint_path)
+
+    weights_path = output_dir / "model_weights.pth"
+    printer.info(f">> Saving bare state_dict to {weights_path} ...")
+    misc.save_on_master(accelerator, model_state, weights_path)
+
     accelerator.wait_for_everyone()
 
 
@@ -464,11 +485,10 @@ def train_one_epoch(
     accum_iter = args.accum_iter
 
     def save_model(epoch, fname, best_so_far, data_iter_step):
-        unwrapped_model = accelerator.unwrap_model(model)
         misc.save_model(
             accelerator=accelerator,
             args=args,
-            model_without_ddp=unwrapped_model,
+            model_without_ddp=model,
             optimizer=optimizer,
             loss_scaler=loss_scaler,
             epoch=epoch,
@@ -491,10 +511,12 @@ def train_one_epoch(
 
 
     optimizer.zero_grad()
+    train_one_epoch._nan_skip = 0
+    train_one_epoch._nonfinite_skip = 0
 
     start_step = args.start_step
 
-    show_pbar = accelerator.is_main_process and sys.stdout.isatty()
+    show_pbar = accelerator.is_main_process
     data_iter = tqdm(
         data_loader,
         total=len(data_loader),
@@ -544,17 +566,31 @@ def train_one_epoch(
             )
             all_finite = accelerator.gather(finite_flag).min().item() > 0.5
             if not all_finite:
+                nonfinite_skip = getattr(train_one_epoch, '_nonfinite_skip', 0) + 1
+                train_one_epoch._nonfinite_skip = nonfinite_skip
                 debug_views = []
                 if isinstance(batch, list):
                     for i, v in enumerate(batch):
                         if not isinstance(v, dict):
                             continue
+                        evt = v.get("event_voxel")
+                        evt_info = None
+                        if evt is not None and torch.is_tensor(evt):
+                            evt_info = {
+                                "shape": list(evt.shape),
+                                "has_nan": bool(torch.isnan(evt).any()),
+                                "has_inf": bool(torch.isinf(evt).any()),
+                                "min": float(evt.min()),
+                                "max": float(evt.max()),
+                                "std": float(evt.std()),
+                            }
                         debug_views.append(
                             {
                                 "i": i,
                                 "dataset": v.get("dataset"),
                                 "label": v.get("label"),
                                 "instance": v.get("instance"),
+                                "event_info": evt_info,
                             }
                         )
                 elif isinstance(batch, dict):
@@ -567,19 +603,50 @@ def train_one_epoch(
                     )
 
                 if accelerator.is_main_process:
+                    safe_details = {k: v for k, v in loss_details.items()
+                                    if isinstance(v, (int, float, str, bool))}
                     printer.error(
-                        f"Non-finite loss at step={step} data_iter_step={data_iter_step} loss={loss_value} details={loss_details} views={debug_views}"
+                        f"Non-finite loss at step={step} (total_skips={nonfinite_skip}) "
+                        f"loss={loss_value} details={safe_details} views={debug_views}"
                     )
+                if nonfinite_skip >= 100:
+                    if accelerator.is_main_process:
+                        printer.error(
+                            f"100 cumulative non-finite losses in this epoch — stopping epoch early"
+                        )
+                    optimizer.zero_grad()
+                    break
                 optimizer.zero_grad()
                 continue
+
             if not result.get("already_backprop", False):
-                loss_scaler(
+                grad_norm = loss_scaler(
                     loss,
                     optimizer,
                     parameters=model.parameters(),
                     update_grad=True,
                     clip_grad=1.0,
                 )
+                if grad_norm is not None and (torch.isnan(grad_norm) or torch.isinf(grad_norm)):
+                    nan_skip_counter = getattr(train_one_epoch, '_nan_skip', 0) + 1
+                    train_one_epoch._nan_skip = nan_skip_counter
+                    if accelerator.is_main_process:
+                        safe_details = {k: v for k, v in loss_details.items()
+                                        if isinstance(v, (int, float, str, bool))}
+                        printer.warning(
+                            f"NaN/Inf grad norm at step={step}, skipping update "
+                            f"(consecutive={nan_skip_counter}, loss={loss_value:.4f}, "
+                            f"details={safe_details})"
+                        )
+                    if nan_skip_counter >= 50:
+                        if accelerator.is_main_process:
+                            printer.error(
+                                f"50 consecutive NaN grad norms — training is diverged, stopping epoch early"
+                            )
+                        optimizer.zero_grad()
+                        break
+                else:
+                    train_one_epoch._nan_skip = 0
                 optimizer.zero_grad()
 
             is_metric = batch[0]["is_metric"]
@@ -609,22 +676,24 @@ def train_one_epoch(
                     torch.tensor(loss_value).to(accelerator.device)
                 ).mean()  # MUST BE EXECUTED BY ALL NODES
 
-                if log_writer is None:
-                    continue
-                """ We use epoch_1000x as the x-axis in tensorboard.
-                This calibrates different curves when batch size changes.
-                """
-                epoch_1000x = int(epoch_f * 1000)
-                log_writer.add_scalar("train_loss", loss_value_reduce, step)
-                log_writer.add_scalar("train_lr", lr, step)
-                log_writer.add_scalar("train_iter", epoch_1000x, step)
-                for name, val in loss_details.items():
-                    if isinstance(val, torch.Tensor):
-                        if val.ndim > 0:
+                if log_writer is not None:
+                    epoch_1000x = int(epoch_f * 1000)
+                    log_writer.add_scalar("train_loss", loss_value_reduce, step)
+                    log_writer.add_scalar("train_lr", lr, step)
+                    log_writer.add_scalar("train_iter", epoch_1000x, step)
+                    for name, val in loss_details.items():
+                        if isinstance(val, torch.Tensor):
+                            if val.ndim > 0:
+                                continue
+                        if isinstance(val, dict):
                             continue
-                    if isinstance(val, dict):
-                        continue
-                    log_writer.add_scalar("train_" + name, val, step)
+                        log_writer.add_scalar("train_" + name, val, step)
+
+                    raw_model = accelerator.unwrap_model(model)
+                    if hasattr(raw_model, "aggregator") and getattr(raw_model.aggregator, "inject_adapters", None) is not None:
+                        for i, adapter in enumerate(raw_model.aggregator.inject_adapters):
+                            gate = adapter.scale.data.tanh().item()
+                            log_writer.add_scalar(f"adapter_gate/{i}", gate, step)
 
         if (
             data_iter_step % int(args.save_freq * len(data_loader)) == 0

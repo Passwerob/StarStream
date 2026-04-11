@@ -21,6 +21,7 @@ def parse_args():
     p.add_argument("--output", type=str, required=True)
     p.add_argument("--fusion", type=str, default="crossattn", choices=["none", "crossattn"])
     p.add_argument("--event_in_chans", type=int, default=8)
+    p.add_argument("--inject_interval", type=int, default=4)
     p.add_argument("--img_size", type=int, default=518)
     p.add_argument("--patch_size", type=int, default=14)
     p.add_argument("--embed_dim", type=int, default=1024)
@@ -183,6 +184,7 @@ def main():
         fusion=args.fusion,
         use_event=(args.fusion != "none"),
         event_in_chans=args.event_in_chans,
+        inject_interval=args.inject_interval,
     ).to(device)
 
     sd = load_checkpoint(args.checkpoint)
@@ -206,6 +208,7 @@ def main():
 
     with torch.no_grad():
         for idx, (view, frame_name) in enumerate(zip(views, frame_names)):
+            print(f"[{idx+1}/{len(views)}] {frame_name}")
             for k in view:
                 view[k] = view[k].to(device, non_blocking=True)
 

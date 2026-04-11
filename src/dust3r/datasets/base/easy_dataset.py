@@ -218,3 +218,121 @@ class CatDataset(EasyDataset):
         for dataset in self.datasets[1:]:
             assert dataset.num_views == num_views
         return num_views
+
+
+class CurriculumMixDataset(EasyDataset):
+    """Mix two datasets with an epoch-dependent ratio (curriculum learning).
+
+    During warmup epochs, only dataset_a is used.  After warmup, dataset_b's
+    share increases linearly until it reaches ``final_ratio_b``, while
+    dataset_a never drops below ``min_ratio_a``.
+
+    Both datasets must share the same resolutions and num_views.
+
+    Usage (in yaml, via eval):
+        CurriculumMixDataset(
+            total_size=10000,
+            dataset_a=DL3DV_ScreenEvent_Multi(...),   # simulated
+            dataset_b=DL3DV_ScreenEvent_Multi(...),   # real
+            total_epochs=10,
+            warmup_epochs=2,
+            final_ratio_b=0.8,
+            min_ratio_a=0.2,
+        )
+    """
+
+    def __init__(
+        self,
+        total_size,
+        dataset_a,
+        dataset_b,
+        total_epochs=10,
+        warmup_epochs=2,
+        final_ratio_b=0.8,
+        min_ratio_a=0.2,
+        initial_ratio_b=0.0,
+    ):
+        assert isinstance(total_size, int) and total_size > 0
+        assert 0.0 <= final_ratio_b <= 1.0
+        assert 0.0 <= min_ratio_a <= 1.0
+        assert 0.0 <= initial_ratio_b <= final_ratio_b
+        self.total_size = total_size
+        self.dataset_a = dataset_a
+        self.dataset_b = dataset_b
+        self.total_epochs = total_epochs
+        self.warmup_epochs = warmup_epochs
+        self.final_ratio_b = min(final_ratio_b, 1.0 - min_ratio_a)
+        self.min_ratio_a = min_ratio_a
+        self.initial_ratio_b = initial_ratio_b
+
+    def __len__(self):
+        return self.total_size
+
+    def __repr__(self):
+        return (
+            f"CurriculumMix(total={self.total_size}, "
+            f"warmup={self.warmup_epochs}, final_b={self.final_ratio_b:.2f}, "
+            f"a={repr(self.dataset_a)}, b={repr(self.dataset_b)})"
+        )
+
+    def _get_ratio_b(self, epoch):
+        if epoch < self.warmup_epochs:
+            if self.initial_ratio_b > 0 and self.warmup_epochs > 0:
+                warmup_progress = epoch / self.warmup_epochs
+                return self.initial_ratio_b * warmup_progress
+            return self.initial_ratio_b
+        ramp_length = max(self.total_epochs - self.warmup_epochs - 1, 1)
+        progress = min((epoch - self.warmup_epochs) / ramp_length, 1.0)
+        return self.initial_ratio_b + progress * (self.final_ratio_b - self.initial_ratio_b)
+
+    def set_epoch(self, epoch):
+        ratio_b = self._get_ratio_b(epoch)
+        n_b = int(self.total_size * ratio_b)
+        n_a = self.total_size - n_b
+
+        rng = np.random.default_rng(seed=epoch + 777)
+
+        perm_a = rng.permutation(len(self.dataset_a))
+        idxs_a = np.concatenate(
+            [perm_a] * (1 + (n_a - 1) // max(len(self.dataset_a), 1))
+        )[:n_a]
+
+        if n_b > 0:
+            perm_b = rng.permutation(len(self.dataset_b))
+            idxs_b = np.concatenate(
+                [perm_b] * (1 + (n_b - 1) // max(len(self.dataset_b), 1))
+            )[:n_b]
+        else:
+            idxs_b = np.array([], dtype=np.intp)
+
+        sources = np.concatenate([
+            np.zeros(n_a, dtype=np.intp),
+            np.ones(n_b, dtype=np.intp),
+        ])
+        local_idxs = np.concatenate([idxs_a, idxs_b])
+
+        shuffle_order = rng.permutation(self.total_size)
+        self._sources = sources[shuffle_order]
+        self._local_idxs = local_idxs[shuffle_order]
+
+        print(f"[CurriculumMix] epoch={epoch}, "
+              f"ratio_b={ratio_b:.2%}, n_a={n_a}, n_b={n_b}")
+
+    def __getitem__(self, idx):
+        assert hasattr(self, "_sources"), (
+            "Call set_epoch() before __getitem__()"
+        )
+        if isinstance(idx, tuple):
+            idx, other, another = idx
+            ds = self.dataset_a if self._sources[idx] == 0 else self.dataset_b
+            return ds[int(self._local_idxs[idx]), other, another]
+        ds = self.dataset_a if self._sources[idx] == 0 else self.dataset_b
+        return ds[int(self._local_idxs[idx])]
+
+    @property
+    def _resolutions(self):
+        return self.dataset_a._resolutions
+
+    @property
+    def num_views(self):
+        return self.dataset_a.num_views
