@@ -196,7 +196,7 @@ class CrossAttnAdapter(nn.Module):
         self.norm_q = nn.LayerNorm(embed_dim)
         self.norm_kv = nn.LayerNorm(embed_dim)
         self.attn = FSDPCrossAttention(embed_dim=embed_dim, num_heads=num_heads)
-        self.scale = nn.Parameter(torch.zeros(1))
+        self.scale = nn.Parameter(torch.tensor([0.01]))
         self.gate_proj = nn.Sequential(
             nn.LayerNorm(embed_dim * 2),
             nn.Linear(embed_dim * 2, embed_dim),
