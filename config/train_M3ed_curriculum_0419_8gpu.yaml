@@ -1,0 +1,226 @@
+# ============================================================
+#  Full-scale 8-GPU training config — 2026-04-19
+#
+#  10-epoch slow-injection curriculum.
+#  Key design: dark ramp and real-data injection run IN PARALLEL,
+#  so the model first meets real data at moderate darkness (level ≤ 2),
+#  not at the extreme end. Each dark level stays for 2 epochs.
+#
+#  Data:  DL3DV (sim, GT pose, DA3 depth, low-light 1-4)
+#         M3ED  (real day+night, DA3 depth, real events)
+#         DSEC  (real day, DA3 depth, real events)
+#  Loss:  GtPoseDistillLoss + L_pose_sc + L_evt
+#  Fusion: CrossAttn + SNR×event-density prior
+#
+#  Epoch-by-epoch schedule:
+#  ┌───────┬────────────┬──────────┬───────┬──────┬───────────────────────────────┐
+#  │ Epoch │ dark_level │ ratio_b  │  n_a  │ n_b  │ What happens                  │
+#  ├───────┼────────────┼──────────┼───────┼──────┼───────────────────────────────┤
+#  │   0   │  0 (clean) │   0.0%   │ 10000 │    0 │ clean warmup                  │
+#  │   1   │  ≤ 1       │   0.0%   │ 10000 │    0 │ mild dark, L_evt on           │
+#  │   2   │  ≤ 2       │   0.0%   │ 10000 │    0 │ medium dark, sim only         │
+#  │   3   │  ≤ 2       │   5.0%   │  9500 │  500 │ first real data, L_pose_sc on │
+#  │   4   │  ≤ 3       │  12.5%   │  8750 │ 1250 │ deeper dark + more real       │
+#  │   5   │  ≤ 3       │  20.0%   │  8000 │ 2000 │ consolidate                   │
+#  │   6   │  ≤ 4       │  27.5%   │  7250 │ 2750 │ extreme dark unlocked         │
+#  │   7   │  ≤ 4       │  35.0%   │  6500 │ 3500 │ ramp continues                │
+#  │   8   │  ≤ 4       │  42.5%   │  5750 │ 4250 │ approaching final mix         │
+#  │   9   │  ≤ 4       │  50.0%   │  5000 │ 5000 │ final 50/50 mix               │
+#  └───────┴────────────┴──────────┴───────┴──────┴───────────────────────────────┘
+#
+#  vs 0416 (7 ep): real data appeared at epoch 5 (25%) under extreme dark;
+#  now it appears at epoch 3 (5%) under moderate dark — much gentler transition.
+# ============================================================
+
+# --- paths ---
+save_dir: '../checkpoints'
+exp_name: 'vggt_train_M3ed_curriculum_0419'
+task: 'StreamVGGT'
+logdir: ${save_dir}/${exp_name}/logs
+output_dir: ${save_dir}/${exp_name}/
+hydra:
+  verbose: False
+  run:
+    dir: ${save_dir}/${exp_name}
+
+# --- model ---
+teacher: ../ckpt/model.pt
+pretrained: ../ckpt/model.pt
+load_only_encoder: False
+long_context: False
+fixed_length: True
+resume: Null
+benchmark: False
+fusion: crossattn
+use_event: True
+event_in_chans: 8
+event_patch_size: Null
+inject_interval: 4
+use_fuse_prior: True
+
+# --- backbone ---
+train_dino: False
+dino_lr_scale: 0.05
+
+# --- view sampling ---
+num_views: 23
+num_views_min: 19
+num_views_max: 25
+num_test_views: 6
+n_corres_train: 0
+n_corres_test: 0
+allow_repeat: False
+sample_mode: mixed
+sequence_ratio: 0.75
+
+# --- loss weights ---
+# GtPoseDistillLoss = hybrid supervision:
+#   camera -> dataset GT when available, else teacher
+#   depth  -> DA3 pseudo-GT when available, else teacher
+#   pmap   -> teacher (unchanged)
+#   track  -> teacher (unchanged)
+#   pose_sc -> self-consistency between adjacent predicted poses (activates at warmup_pose_sc)
+#   evt     -> event brightness-constancy constraint (activates at warmup_evt)
+loss_weight_camera: 1.0
+loss_weight_depth: 0.5
+loss_weight_pmap: 0.1
+loss_weight_track: 0.5
+loss_weight_pose_sc: 0.3
+loss_weight_evt: 0.15
+warmup_pose_sc: 3
+warmup_evt: 1
+train_criterion: "GtPoseDistillLoss(lambda_camera=${loss_weight_camera}, lambda_depth=${loss_weight_depth}, lambda_pmap=${loss_weight_pmap}, lambda_track=${loss_weight_track}, lambda_pose_sc=${loss_weight_pose_sc}, lambda_evt=${loss_weight_evt}, warmup_pose_sc=${warmup_pose_sc}, warmup_evt=${warmup_evt})"
+test_criterion: "GtPoseDistillLoss(lambda_camera=${loss_weight_camera}, lambda_depth=${loss_weight_depth}, lambda_pmap=${loss_weight_pmap}, lambda_track=${loss_weight_track}, lambda_pose_sc=${loss_weight_pose_sc}, lambda_evt=${loss_weight_evt}, warmup_pose_sc=${warmup_pose_sc}, warmup_evt=${warmup_evt})"
+
+# ============================================================
+#  Datasets
+# ============================================================
+
+# --- DL3DV (sim): GT pose + DA3 depth + simulated events + low-light ---
+use_sim: True
+dataset_sim: DL3DV_ScreenEvent_Multi(
+  allow_repeat=${allow_repeat},
+  split='train',
+  ROOT='/robby/share/MM/datasets/PRFL/dl3dv_processed',
+  resolution=[(518, 392), (518, 336), (518, 294), (518, 266), (518, 210), (518, 154), (392, 518), (336, 518), (294, 518), (266, 518)],
+  transform=SeqColorJitter,
+  num_views=${num_views},
+  min_interval=1,
+  max_interval=2,
+  sample_mode='${sample_mode}',
+  sequence_ratio=${sequence_ratio},
+  event_in_chans=8)
+
+# --- M3ED (real): daylight + night, DA3 depth, real events ---
+use_m3ed: True
+dataset_real_m3ed: DL3DV_ScreenEvent_Multi(
+  allow_repeat=${allow_repeat},
+  split='train',
+  ROOT='/robby/share/MM/datasets/PRFL/M3edd',
+  resolution=[(518, 392), (518, 336), (518, 294), (518, 266), (518, 210), (518, 154), (392, 518), (336, 518), (294, 518), (266, 518)],
+  transform=SeqColorJitter,
+  num_views=${num_views},
+  min_interval=1,
+  max_interval=2,
+  sample_mode='${sample_mode}',
+  sequence_ratio=${sequence_ratio},
+  event_in_chans=8)
+
+# --- DSEC (real): daytime driving, DA3 depth, real events ---
+# Set use_dsec: False to disable and only use M3ED as real data (like 0416).
+use_dsec: True
+dataset_real_dsec: DL3DV_ScreenEvent_Multi(
+  allow_repeat=${allow_repeat},
+  split='train',
+  ROOT='/robby/share/MM/datasets/PRFL/DSEC_processed',
+  resolution=[(518, 392), (518, 336), (518, 294), (518, 266), (518, 210), (518, 154), (392, 518), (336, 518), (294, 518), (266, 518)],
+  transform=SeqColorJitter,
+  num_views=${num_views},
+  min_interval=1,
+  max_interval=2,
+  sample_mode='${sample_mode}',
+  sequence_ratio=${sequence_ratio},
+  event_in_chans=8)
+
+# ============================================================
+#  Curriculum schedule — 10-epoch slow injection
+# ============================================================
+curriculum_total_size: 10000
+curriculum_warmup_epochs: 1
+curriculum_final_ratio_b: 0.5
+curriculum_min_ratio_a: 0.5
+curriculum_initial_ratio_b: 0.05
+
+# Phase transitions — dark ramp and real injection overlap:
+#   epoch 0             : clean RGB, sim only (single warmup epoch)
+#   epoch 1-2           : dark ramp begins, sim only
+#   epoch 3             : real data enters at 5% (dark still moderate ≤ 2)
+#   epoch 4-5           : dark deepens to level 3, real ramps to 20%
+#   epoch 6-9           : full dark (level 4), real ramps 27.5% → 50%
+curriculum_dark_start_epoch: 1
+curriculum_real_start_epoch: 3
+
+# Per-epoch max dark level (indexed by epoch - dark_start_epoch).
+# Level 1=mild (~0.4×), 2=medium (~0.27×), 3=dark (~0.16×), 4=extreme (~0.05×).
+# Each level stays for 2 epochs so the model has time to consolidate.
+curriculum_dark_level_schedule: [1, 2, 2, 3, 3, 4, 4, 4, 4]
+
+train_dataset: CurriculumMixDataset(
+  total_size=${curriculum_total_size},
+  dataset_a=${dataset_sim},
+  dataset_b=${dataset_real_m3ed} + ${dataset_real_dsec},
+  total_epochs=${epochs},
+  warmup_epochs=${curriculum_warmup_epochs},
+  final_ratio_b=${curriculum_final_ratio_b},
+  min_ratio_a=${curriculum_min_ratio_a},
+  initial_ratio_b=${curriculum_initial_ratio_b},
+  dark_start_epoch=${curriculum_dark_start_epoch},
+  real_start_epoch=${curriculum_real_start_epoch},
+  dark_level_schedule=${curriculum_dark_level_schedule})
+
+# --- test: M3ED real data (fixed seed=42 for reproducible eval) ---
+test_dataset: 500 @ DL3DV_ScreenEvent_Multi(
+  split='train',
+  ROOT='/robby/share/MM/datasets/PRFL/M3edd',
+  resolution=(518, 392),
+  num_views=${num_test_views},
+  seed=42,
+  min_interval=1,
+  max_interval=3,
+  sample_mode='mixed',
+  sequence_ratio=0.5,
+  event_in_chans=8)
+
+# ============================================================
+#  Training hyper-parameters
+# ============================================================
+seed: 0
+batch_size: 1
+accum_iter: 1
+gradient_checkpointing: True
+epochs: 10
+start_epoch: 0
+start_step: 0
+weight_decay: 0.05
+lr: 5e-6
+min_lr: 1e-7
+warmup_epochs: 1
+amp: 1
+num_workers: 8
+world_size: 1
+local-rank: -1
+dist_url: 'env://'
+rank: 0
+gpu: 0
+distributed: False
+dist_backend: 'nccl'
+
+# --- logging / checkpointing ---
+eval_freq: 1
+max_val_batches: 50
+save_freq: 0.2
+max_checkpoints: 10
+keep_freq: 1
+print_freq: 10
+print_img_freq: 50000000
+num_imgs_vis: 4

@@ -1,0 +1,852 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+import logging
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint_utils
+from typing import Optional, Tuple, Union, List, Dict, Any
+
+from streamvggt.layers import PatchEmbed
+from streamvggt.layers.block import Block
+from streamvggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
+from streamvggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
+
+logger = logging.getLogger(__name__)
+
+_RESNET_MEAN = [0.485, 0.456, 0.406]
+_RESNET_STD = [0.229, 0.224, 0.225]
+
+
+@torch.no_grad()
+def compute_snr_prior(images_01: torch.Tensor, patch_size: int) -> torch.Tensor:
+    """Patch-level RGB reliability prior for quality-aware fusion.
+
+    A pure tensor op (no learnable parameters). For each patch, returns a
+    scalar in [0, 1] that is high when the RGB signal is trustworthy (bright,
+    shot-noise regime behaves well) and low when it is degraded (dark,
+    underexposed). This matches the intuition used in SNR-aware fusion
+    literature (EAG3R / EvLight++): where RGB is unreliable, the fusion gate
+    should pull in more event information.
+
+    Args:
+        images_01: [B*S, 3, H, W] RGB images in the range [0, 1],
+            i.e. BEFORE ImageNet mean/std normalization.
+        patch_size: Patch size used by the RGB patch embed.
+
+    Returns:
+        [B*S, N, 1] in [0, 1], where ``N = (H / patch_size) * (W / patch_size)``.
+        1 = bright & high SNR (trust RGB); 0 = dark & low SNR.
+    """
+    # BT.601 luminance
+    weights = images_01.new_tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1)
+    Y = (images_01 * weights).sum(dim=1, keepdim=True)  # [B*S, 1, H, W]
+
+    mean_Y = F.avg_pool2d(Y, kernel_size=patch_size, stride=patch_size)  # [B*S, 1, Hp, Wp]
+
+    # Rescale to [0, 1]:
+    #   below `dark_floor`  -> 0 (pitch dark, RGB untrustworthy)
+    #   above `bright_ceil` -> 1 (bright enough, RGB trustworthy)
+    # These numbers correspond to raw luminance on the pre-normalization
+    # [0, 1] scale. They are deliberately conservative: most indoor / outdoor
+    # daytime scenes will saturate to 1, most hard low-light scenes fall
+    # below 0.3 linear luminance.
+    dark_floor = 0.05
+    bright_ceil = 0.30
+    snr = ((mean_Y - dark_floor) / (bright_ceil - dark_floor)).clamp(0.0, 1.0)
+
+    return snr.flatten(2).permute(0, 2, 1).contiguous()  # [B*S, N, 1]
+
+
+@torch.no_grad()
+def compute_event_prior(event_voxel_bs: torch.Tensor, patch_size: int) -> torch.Tensor:
+    """Patch-level event density prior for quality-aware fusion.
+
+    A pure tensor op (no learnable parameters). Returns a scalar in [0, 1]
+    per patch indicating how informative the event stream is locally.
+
+    Per-sample normalization against the 90th percentile makes the prior
+    scale-invariant to absolute density differences across day / dark / sensor,
+    so that ``(1 - snr_prior) * event_prior`` has a meaningful magnitude
+    regardless of the absolute event rate of the current clip.
+
+    Args:
+        event_voxel_bs: [B*S, C_evt, H, W] event voxel. Expected to be AFTER
+            per-frame znorm (as produced by the dataset).
+        patch_size: Patch size used by the RGB patch embed (must match
+            the spatial stride of the event encoder).
+
+    Returns:
+        [B*S, N, 1] in [0, 1]. 1 = dense event patch (relative to the clip),
+        0 = no events.
+    """
+    # Aggregate magnitude across event channels/time bins.
+    ev_abs = event_voxel_bs.abs().sum(dim=1, keepdim=True)  # [B*S, 1, H, W]
+    mean_ev = F.avg_pool2d(ev_abs, kernel_size=patch_size, stride=patch_size)  # [B*S, 1, Hp, Wp]
+
+    # Per-sample 90th-percentile normalization. ``torch.quantile`` requires
+    # fp32/fp64 on CUDA, so cast defensively in case we're under bf16 autocast.
+    bs = mean_ev.shape[0]
+    flat = mean_ev.reshape(bs, -1).float()
+    q90 = torch.quantile(flat, 0.9, dim=1, keepdim=True).clamp(min=1e-6)
+    q90 = q90.unsqueeze(-1).unsqueeze(-1).to(mean_ev.dtype)  # [B*S, 1, 1, 1]
+
+    prior = (mean_ev / q90).clamp(0.0, 1.0)
+    return prior.flatten(2).permute(0, 2, 1).contiguous()  # [B*S, N, 1]
+
+
+class EventPatchEmbed(nn.Module):
+    def __init__(self, in_chans: int, embed_dim: int, patch_size: int):
+        super().__init__()
+        self.patch_size = patch_size
+        self.proj = nn.Conv2d(
+            in_channels=in_chans,
+            out_channels=embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _, _, H, W = x.shape
+        if H % self.patch_size != 0 or W % self.patch_size != 0:
+            raise ValueError(
+                f"EventPatchEmbed expects H/W divisible by patch_size={self.patch_size}, got H={H}, W={W}"
+            )
+        x = self.proj(x)
+        x = x.flatten(2).transpose(1, 2)
+        x = self.norm(x)
+        return x
+
+
+class EventEncoder(nn.Module):
+    """
+    Enhanced event encoder: temporal bin mixing + multi-layer CNN stem.
+
+    Compared to EventPatchEmbed (single Conv2d), this provides:
+    - Explicit temporal modeling via pointwise MLP across event bins
+    - Richer spatial feature extraction via multi-layer CNN
+    - Total spatial stride = 2 * (patch_size // 2) = patch_size
+    """
+
+    def __init__(self, in_chans: int, embed_dim: int, patch_size: int):
+        super().__init__()
+        assert patch_size % 2 == 0, f"EventEncoder requires even patch_size, got {patch_size}"
+        self.patch_size = patch_size
+        mid = embed_dim // 4
+        mid2 = embed_dim // 2
+        second_stride = patch_size // 2
+
+        self.temporal_mix = nn.Sequential(
+            nn.Conv2d(in_chans, in_chans * 2, 1),
+            nn.GELU(),
+            nn.Conv2d(in_chans * 2, in_chans, 1),
+            nn.GELU(),
+        )
+
+        self.spatial_stem = nn.Sequential(
+            nn.Conv2d(in_chans, mid, 7, stride=2, padding=3),
+            nn.GELU(),
+            nn.GroupNorm(min(8, mid), mid),
+            nn.Conv2d(mid, mid2, 3, stride=1, padding=1),
+            nn.GELU(),
+            nn.GroupNorm(min(8, mid2), mid2),
+            nn.Conv2d(mid2, embed_dim, second_stride, stride=second_stride),
+        )
+
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _, _, H, W = x.shape
+        if H % self.patch_size != 0 or W % self.patch_size != 0:
+            raise ValueError(
+                f"EventEncoder expects H/W divisible by patch_size={self.patch_size}, got H={H}, W={W}"
+            )
+        x = x + self.temporal_mix(x)
+        x = self.spatial_stem(x)
+        x = x.flatten(2).transpose(1, 2)
+        x = self.norm(x)
+        return x
+
+
+class FSDPCrossAttention(nn.Module):
+    """FSDP-safe cross-attention using explicit nn.Linear modules.
+
+    ``nn.MultiheadAttention`` internally calls ``F.multi_head_attention_forward``
+    which accesses ``out_proj.weight`` as a raw tensor — bypassing the module's
+    ``forward()`` and therefore FSDP's unshard hook.  When size-based wrapping
+    individually wraps ``out_proj`` (>1 M params for embed_dim=1024), the weight
+    stays flat/1-D and the ``linear()`` call crashes.
+
+    This class replaces all functional paths with explicit ``nn.Linear`` calls
+    so every parameter is always properly unshard'd by FSDP.
+    """
+
+    def __init__(self, embed_dim: int, num_heads: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        assert embed_dim % num_heads == 0
+
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        B, Nq, C = query.shape
+        Nk = key.shape[1]
+
+        q = self.q_proj(query).reshape(B, Nq, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.k_proj(key).reshape(B, Nk, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.v_proj(value).reshape(B, Nk, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        attn_out = F.scaled_dot_product_attention(q, k, v)  # (B, H, Nq, D)
+        attn_out = attn_out.permute(0, 2, 1, 3).reshape(B, Nq, C)
+        return self.out_proj(attn_out)
+
+
+class CrossAttnFuse(nn.Module):
+    """RGB <- Event cross-attention fusion with optional quality-aware prior.
+
+    Baseline behavior (``prior=None``): a zero-initialized Tanh gate controls
+    how much event information is injected into each RGB patch. The gate is
+    purely content-based (Linear on concat([rgb_patch, attn_out])).
+
+    Quality-aware behavior (``prior`` supplied): an extra per-patch scalar
+    drives fusion from the input statistics rather than from the learned gate.
+    The scalar enters as an additive bias on the gate:
+
+        effective_gate = gate + prior_strength * prior
+        fused_patch    = rgb_patch + effective_gate * attn_out
+
+    ``prior_strength`` is zero-initialized so that, at step 0, the module is
+    IDENTICAL to the baseline. If the data-driven prior is useful, this
+    scalar grows; if not, it stays near zero and the baseline behavior is
+    preserved.
+    """
+
+    def __init__(self, embed_dim: int, num_heads: int):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(embed_dim)
+        self.norm_kv = nn.LayerNorm(embed_dim)
+        self.attn = FSDPCrossAttention(embed_dim=embed_dim, num_heads=num_heads)
+        self.gate_proj = nn.Sequential(
+            nn.LayerNorm(embed_dim * 2),
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.Tanh(),
+        )
+        nn.init.zeros_(self.gate_proj[1].weight)
+        nn.init.zeros_(self.gate_proj[1].bias)
+        # Learnable scalar that gates how much the data-driven `prior` affects
+        # the fusion. Zero init => warmup-safe (identical to pre-prior code).
+        self.prior_strength = nn.Parameter(torch.zeros(1))
+
+    def forward(
+        self,
+        rgb_tokens: torch.Tensor,
+        event_kv: torch.Tensor,
+        prior: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if rgb_tokens.shape[1] == event_kv.shape[1] + 1:
+            rgb_cls = rgb_tokens[:, :1]
+            rgb_patch = rgb_tokens[:, 1:]
+        else:
+            rgb_cls = None
+            rgb_patch = rgb_tokens
+
+        if rgb_patch.shape[1] != event_kv.shape[1]:
+            raise ValueError(
+                "CrossAttnFuse token count mismatch: "
+                f"rgb_tokens shape={tuple(rgb_tokens.shape)}, "
+                f"rgb_patch shape={tuple(rgb_patch.shape)}, "
+                f"event_kv shape={tuple(event_kv.shape)}"
+            )
+
+        q = self.norm_q(rgb_patch)
+        kv = self.norm_kv(event_kv)
+        attn_out = self.attn(q, kv, kv)
+        attn_out = torch.nan_to_num(attn_out, nan=0.0, posinf=0.0, neginf=0.0)
+
+        gate = self.gate_proj(torch.cat([rgb_patch, attn_out], dim=-1))  # [B*S, N, C]
+        if prior is not None:
+            # prior: [B*S, N, 1]; prior_strength: [1]; broadcast -> [B*S, N, C].
+            # Cast to gate dtype so mixed-precision (autocast) stays consistent.
+            prior_contrib = (self.prior_strength * prior).to(gate.dtype)
+            effective_gate = gate + prior_contrib
+        else:
+            effective_gate = gate
+        fused_patch = rgb_patch + effective_gate * attn_out
+
+        if rgb_cls is not None:
+            fused_tokens = torch.cat([rgb_cls, fused_patch], dim=1)
+        else:
+            fused_tokens = fused_patch
+        return fused_tokens
+
+
+class CrossAttnAdapter(nn.Module):
+    """
+    Zero-initialized cross-attention adapter for deep event injection.
+
+    Injects event information into backbone tokens at intermediate layers.
+    Double zero-init: global scalar `scale` (starts at 0) x per-token `gate`
+    (tanh with zero-init weights) ensures no disruption to pre-trained weights.
+
+    Optionally accepts a data-driven per-patch ``prior`` scalar (same shape
+    convention as ``CrossAttnFuse.forward``) to make deep injection
+    quality-aware. The prior enters as an additive bias on the gate, scaled
+    by a learnable zero-initialized ``prior_strength``.
+    """
+
+    def __init__(self, embed_dim: int, num_heads: int):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(embed_dim)
+        self.norm_kv = nn.LayerNorm(embed_dim)
+        self.attn = FSDPCrossAttention(embed_dim=embed_dim, num_heads=num_heads)
+        self.scale = nn.Parameter(torch.tensor([0.01]))
+        self.gate_proj = nn.Sequential(
+            nn.LayerNorm(embed_dim * 2),
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.Tanh(),
+        )
+        nn.init.zeros_(self.gate_proj[1].weight)
+        nn.init.zeros_(self.gate_proj[1].bias)
+        # Data-driven prior strength (zero-init => baseline at step 0).
+        self.prior_strength = nn.Parameter(torch.zeros(1))
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        event_kv: torch.Tensor,
+        patch_start_idx: int,
+        prior: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        special = tokens[:, :patch_start_idx]
+        patch = tokens[:, patch_start_idx:]
+
+        q = self.norm_q(patch)
+        kv = self.norm_kv(event_kv)
+        attn_out = self.attn(q, kv, kv)
+        attn_out = torch.nan_to_num(attn_out, nan=0.0, posinf=0.0, neginf=0.0)
+
+        gate = self.gate_proj(torch.cat([patch, attn_out], dim=-1))  # [B*S, N, C]
+        if prior is not None:
+            prior_contrib = (self.prior_strength * prior).to(gate.dtype)
+            effective_gate = gate + prior_contrib
+        else:
+            effective_gate = gate
+        patch = patch + self.scale.tanh() * effective_gate * attn_out
+        return torch.cat([special, patch], dim=1)
+
+
+class Aggregator(nn.Module):
+    """
+    The Aggregator applies alternating-attention over input frames,
+    as described in VGGT: Visual Geometry Grounded Transformer.
+
+
+    Args:
+        img_size (int): Image size in pixels.
+        patch_size (int): Size of each patch for PatchEmbed.
+        embed_dim (int): Dimension of the token embeddings.
+        depth (int): Number of blocks.
+        num_heads (int): Number of attention heads.
+        mlp_ratio (float): Ratio of MLP hidden dim to embedding dim.
+        num_register_tokens (int): Number of register tokens.
+        block_fn (nn.Module): The block type used for attention (Block by default).
+        qkv_bias (bool): Whether to include bias in QKV projections.
+        proj_bias (bool): Whether to include bias in the output projection.
+        ffn_bias (bool): Whether to include bias in MLP layers.
+        patch_embed (str): Type of patch embed. e.g., "conv" or "dinov2_vitl14_reg".
+        aa_order (list[str]): The order of alternating attention, e.g. ["frame", "global"].
+        aa_block_size (int): How many blocks to group under each attention type before switching. If not necessary, set to 1.
+        qk_norm (bool): Whether to apply QK normalization.
+        rope_freq (int): Base frequency for rotary embedding. -1 to disable.
+        init_values (float): Init scale for layer scale.
+    """
+
+    def __init__(
+        self,
+        img_size=518,
+        patch_size=14,
+        embed_dim=1024,
+        depth=24,
+        num_heads=16,
+        mlp_ratio=4.0,
+        num_register_tokens=4,
+        block_fn=Block,
+        qkv_bias=True,
+        proj_bias=True,
+        ffn_bias=True,
+        patch_embed="dinov2_vitl14_reg",
+        aa_order=["frame", "global"],
+        aa_block_size=1,
+        qk_norm=True,
+        rope_freq=100,
+        init_values=0.01,
+        fusion="none",
+        use_event=False,
+        event_in_chans=8,
+        event_patch_size=None,
+        inject_interval=0,
+        use_fuse_prior=True,
+    ):
+        super().__init__()
+
+        self.__build_patch_embed__(patch_embed, img_size, patch_size, num_register_tokens, embed_dim=embed_dim)
+
+        # Initialize rotary position embedding if frequency > 0
+        self.rope = RotaryPositionEmbedding2D(frequency=rope_freq) if rope_freq > 0 else None
+        self.position_getter = PositionGetter() if self.rope is not None else None
+
+        self.frame_blocks = nn.ModuleList(
+            [
+                block_fn(
+                    dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias,
+                    proj_bias=proj_bias,
+                    ffn_bias=ffn_bias,
+                    init_values=init_values,
+                    qk_norm=qk_norm,
+                    rope=self.rope,
+                )
+                for _ in range(depth)
+            ]
+        )
+
+        self.global_blocks = nn.ModuleList(
+            [
+                block_fn(
+                    dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias,
+                    proj_bias=proj_bias,
+                    ffn_bias=ffn_bias,
+                    init_values=init_values,
+                    qk_norm=qk_norm,
+                    rope=self.rope,
+                )
+                for _ in range(depth)
+            ]
+        )
+
+        self.depth = depth
+        self.aa_order = aa_order
+        self.patch_size = patch_size
+        self.aa_block_size = aa_block_size
+        self.fusion = fusion
+        self.use_event = use_event
+        self.event_patch_size = patch_size if event_patch_size is None else event_patch_size
+        self.inject_interval = inject_interval
+        # Quality-aware fusion prior (SNR x event density). When False, the
+        # fusion degenerates to the content-based gate only (baseline).
+        self.use_fuse_prior = bool(use_fuse_prior)
+
+        if self.fusion not in ["none", "crossattn"]:
+            raise ValueError(f"Unsupported fusion mode: {self.fusion}")
+
+        if self.fusion == "crossattn" or self.use_event:
+            self.event_encoder = EventEncoder(
+                in_chans=event_in_chans,
+                embed_dim=embed_dim,
+                patch_size=self.event_patch_size,
+            )
+            self.event_proj = nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, embed_dim),
+            )
+            self.cross_attn_fuse = CrossAttnFuse(embed_dim=embed_dim, num_heads=num_heads)
+        else:
+            self.event_encoder = None
+            self.event_proj = None
+            self.cross_attn_fuse = None
+
+        # Deep multi-layer injection adapters
+        if self.inject_interval > 0 and (self.fusion == "crossattn" or self.use_event):
+            aa_block_num = depth // aa_block_size
+            num_adapters = aa_block_num // self.inject_interval
+            self.inject_adapters = nn.ModuleList(
+                [CrossAttnAdapter(embed_dim=embed_dim, num_heads=num_heads)
+                 for _ in range(num_adapters)]
+            )
+            self._inject_layer_indices = set(
+                (i + 1) * self.inject_interval - 1 for i in range(num_adapters)
+            )
+            logger.info(
+                "Deep injection: %d adapters at backbone iterations %s",
+                num_adapters, sorted(self._inject_layer_indices),
+            )
+        else:
+            self.inject_adapters = None
+            self._inject_layer_indices = set()
+
+        # Validate that depth is divisible by aa_block_size
+        if self.depth % self.aa_block_size != 0:
+            raise ValueError(f"depth ({depth}) must be divisible by aa_block_size ({aa_block_size})")
+
+        self.aa_block_num = self.depth // self.aa_block_size
+
+        # Note: We have two camera tokens, one for the first frame and one for the rest
+        # The same applies for register tokens
+        self.camera_token = nn.Parameter(torch.randn(1, 2, 1, embed_dim))
+        self.register_token = nn.Parameter(torch.randn(1, 2, num_register_tokens, embed_dim))
+
+        # The patch tokens start after the camera and register tokens
+        self.patch_start_idx = 1 + num_register_tokens
+
+        # Initialize parameters with small values
+        nn.init.normal_(self.camera_token, std=1e-6)
+        nn.init.normal_(self.register_token, std=1e-6)
+
+        self.gradient_checkpointing = False
+
+        # Register normalization constants as buffers
+        for name, value in (
+            ("_resnet_mean", _RESNET_MEAN),
+            ("_resnet_std", _RESNET_STD),
+        ):
+            self.register_buffer(
+                name,
+                torch.FloatTensor(value).reshape(1, 1, 3, 1, 1),
+                persistent=False,
+            )
+
+
+    def __build_patch_embed__(
+        self,
+        patch_embed,
+        img_size,
+        patch_size,
+        num_register_tokens,
+        interpolate_antialias=True,
+        interpolate_offset=0.0,
+        block_chunks=0,
+        init_values=1.0,
+        embed_dim=1024,
+    ):
+        """
+        Build the patch embed layer. If 'conv', we use a
+        simple PatchEmbed conv layer. Otherwise, we use a vision transformer.
+        """
+
+        if "conv" in patch_embed:
+            self.patch_embed = PatchEmbed(img_size=img_size, patch_size=patch_size, in_chans=3, embed_dim=embed_dim)
+        else:
+            vit_models = {
+                "dinov2_vitl14_reg": vit_large,
+                "dinov2_vitb14_reg": vit_base,
+                "dinov2_vits14_reg": vit_small,
+                "dinov2_vitg2_reg": vit_giant2,
+            }
+
+            self.patch_embed = vit_models[patch_embed](
+                img_size=img_size,
+                patch_size=patch_size,
+                num_register_tokens=num_register_tokens,
+                interpolate_antialias=interpolate_antialias,
+                interpolate_offset=interpolate_offset,
+                block_chunks=block_chunks,
+                init_values=init_values,
+            )
+
+            # Disable gradient updates for mask token
+            if hasattr(self.patch_embed, "mask_token"):
+                self.patch_embed.mask_token.requires_grad_(False)
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        event_voxel: Optional[torch.Tensor] = None,
+        fusion: Optional[str] = None,
+        use_event: Optional[bool] = None,
+        past_key_values=None,
+        use_cache=False,
+        past_frame_idx=0
+    ) -> Tuple[List[torch.Tensor], int]:
+        """
+        Args:
+            images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
+                B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
+
+        Returns:
+            (list[torch.Tensor], int):
+                The list of outputs from the attention blocks,
+                and the patch_start_idx indicating where patch tokens begin.
+        """
+        B, S, C_in, H, W = images.shape
+        images_shape = tuple(images.shape)
+
+        if use_cache and past_key_values[0] is not None:
+            _, _, S_true, _, _ = past_key_values[0][0].shape
+            S_true += 1
+        else:
+            S_true = S
+        
+        if use_cache and S > 1:
+            print(f"Use KV cache expects S=1, got S={S}")
+
+        if C_in != 3:
+            raise ValueError(f"Expected 3 input channels, got {C_in}")
+
+        # ------------------------------------------------------------
+        # Quality-aware fusion: compute data-driven priors BEFORE any
+        # normalization, so SNR sees the raw [0, 1] luminance. The result
+        # is a per-patch scalar ``fuse_prior = (1 - snr_prior) * event_prior``
+        # in [0, 1] that is fed to CrossAttnFuse and (optionally) the
+        # CrossAttnAdapter deep-injection modules.
+        # ------------------------------------------------------------
+        active_fusion = self.fusion if fusion is None else fusion
+        active_use_event = self.use_event if use_event is None else use_event
+        do_event_fusion = (
+            active_fusion == "crossattn" and active_use_event and event_voxel is not None
+        )
+
+        fuse_prior: Optional[torch.Tensor] = None
+        if do_event_fusion:
+            if self.event_encoder is None or self.event_proj is None or self.cross_attn_fuse is None:
+                raise RuntimeError("Event fusion is requested but event modules are not initialized.")
+            if event_voxel.shape[:2] != (B, S):
+                raise ValueError(
+                    f"event_voxel shape mismatch with images: images={images_shape}, event_voxel={tuple(event_voxel.shape)}"
+                )
+            # Reshape event_voxel once; reused by the encoder below.
+            event_voxel = event_voxel.reshape(
+                B * S, event_voxel.shape[2], event_voxel.shape[3], event_voxel.shape[4]
+            )
+            if self.use_fuse_prior:
+                # SNR prior needs images in [0, 1] range.
+                imgs_bs3hw_01 = images.reshape(B * S, C_in, H, W)
+                snr_prior = compute_snr_prior(imgs_bs3hw_01, self.patch_size)  # [B*S, N, 1]
+                event_prior = compute_event_prior(event_voxel, self.patch_size)  # [B*S, N, 1]
+                # Dark-and-event-dense patches get the highest prior.
+                fuse_prior = (1.0 - snr_prior) * event_prior
+
+        # Normalize images and reshape for patch embed
+        images = (images - self._resnet_mean.to(images.device)) / self._resnet_std.to(images.device)
+
+        # Reshape to [B*S, C, H, W] for patch embedding
+        images = images.reshape(B * S, C_in, H, W)
+        patch_tokens = self.patch_embed(images)
+
+        if isinstance(patch_tokens, dict):
+            patch_tokens = patch_tokens["x_norm_patchtokens"]
+
+        rgb_tokens = patch_tokens
+        event_kv = None
+
+        if do_event_fusion:
+            event_tokens = self.event_encoder(event_voxel)  # already reshaped above
+            event_kv = self.event_proj(event_tokens)
+            rgb_tokens = self.cross_attn_fuse(rgb_tokens, event_kv, prior=fuse_prior)
+
+        _, P, C = rgb_tokens.shape
+
+        if use_cache:
+            camera_token_full = slice_expand_and_flatten(self.camera_token, B, S_true)
+            camera_token = camera_token_full[-1:, :, :]
+            
+            register_token_full = slice_expand_and_flatten(self.register_token, B, S_true)
+            register_token = register_token_full[-1:, :, :]
+        else:
+            camera_token = slice_expand_and_flatten(self.camera_token, B, S)
+            register_token = slice_expand_and_flatten(self.register_token, B, S)
+        # Concatenate special tokens with patch tokens
+        tokens = torch.cat([camera_token, register_token, rgb_tokens], dim=1)
+
+        pos = None
+        if self.rope is not None:
+            pos = self.position_getter(B * S, H // self.patch_size, W // self.patch_size, device=images.device)
+
+        if self.patch_start_idx > 0:
+            # do not use position embedding for special tokens (camera and register tokens)
+            # so set pos to 0 for the special tokens
+            pos = pos + 1
+            pos_special = torch.zeros(B * S, self.patch_start_idx, 2).to(images.device).to(pos.dtype)
+            pos = torch.cat([pos_special, pos], dim=1)
+
+        # update P because we added special tokens
+        _, P, C = tokens.shape
+
+        frame_idx = 0
+        global_idx = 0
+        output_list = []
+        adapter_idx = 0
+
+        for block_iter in range(self.aa_block_num):
+            for attn_type in self.aa_order:
+                if attn_type == "frame":
+                    tokens, frame_idx, frame_intermediates = self._process_frame_attention(
+                        tokens, B, S, P, C, frame_idx, pos=pos
+                    )
+                    # Deep injection: apply adapter after frame attention at scheduled layers
+                    if (event_kv is not None
+                            and self.inject_adapters is not None
+                            and block_iter in self._inject_layer_indices):
+                        if tokens.shape != (B * S, P, C):
+                            tokens = tokens.reshape(B, S, P, C).reshape(B * S, P, C)
+                        adapter = self.inject_adapters[adapter_idx]
+                        psi = self.patch_start_idx
+                        if self.gradient_checkpointing and self.training:
+                            # Capture fuse_prior via closure so that None (ablation /
+                            # no-prior mode) is handled uniformly and we don't pass
+                            # non-tensor args to torch.utils.checkpoint.
+                            _pr_capt = fuse_prior
+                            def _adapter_fwd(_tok, _ekv, _a=adapter, _p=psi, _pr=_pr_capt):
+                                return _a(_tok, _ekv, _p, prior=_pr)
+                            tokens = checkpoint_utils.checkpoint(
+                                _adapter_fwd, tokens, event_kv, use_reentrant=False
+                            )
+                        else:
+                            tokens = adapter(tokens, event_kv, psi, prior=fuse_prior)
+                        adapter_idx += 1
+                elif attn_type == "global":
+                    if use_cache:
+                        if past_key_values[global_idx] is not None:
+                            k, v = past_key_values[global_idx]
+                        tokens, global_idx, global_intermediates, new_kv = self._process_global_attention(
+                            tokens, B, S, P, C, global_idx, pos=pos,
+                            past_key_values_block=past_key_values[global_idx] if past_key_values[global_idx] is not None else None,
+                            use_cache=True,
+                            past_frame_idx=past_frame_idx
+                        )
+                        past_key_values[global_idx - 1] = new_kv
+                    else: 
+                        tokens, global_idx, global_intermediates = self._process_global_attention(
+                            tokens, B, S, P, C, global_idx, pos=pos
+                        )
+                else:
+                    raise ValueError(f"Unknown attention type: {attn_type}")
+            for i in range(len(frame_intermediates)):
+                # concat frame and global intermediates, [B x S x P x 2C]
+                concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
+                output_list.append(concat_inter)
+
+        del concat_inter
+        del frame_intermediates
+        del global_intermediates
+        if use_cache:      
+            return output_list, self.patch_start_idx, past_key_values
+        return output_list, self.patch_start_idx
+
+    def set_gradient_checkpointing(self, enable: bool = True):
+        self.gradient_checkpointing = bool(enable)
+
+    def _run_block(self, block, tokens, pos=None, attn_mask=None):
+        if self.gradient_checkpointing and self.training:
+            def custom_forward(x):
+                return block(x, pos=pos, attn_mask=attn_mask)
+            return checkpoint_utils.checkpoint(custom_forward, tokens, use_reentrant=False)
+        return block(tokens, pos=pos, attn_mask=attn_mask)
+
+    def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
+        """
+        Process frame attention blocks. We keep tokens in shape (B*S, P, C).
+        """
+        # If needed, reshape tokens or positions:
+        if tokens.shape != (B * S, P, C):
+            tokens = tokens.reshape(B, S, P, C).reshape(B * S, P, C)
+
+        if pos is not None and pos.shape != (B * S, P, 2):
+            pos = pos.reshape(B, S, P, 2).reshape(B * S, P, 2)
+
+        intermediates = []
+
+        # by default, self.aa_block_size=1, which processes one block at a time
+        for _ in range(self.aa_block_size):
+            tokens = self._run_block(self.frame_blocks[frame_idx], tokens, pos=pos)
+            frame_idx += 1
+            intermediates.append(tokens.reshape(B, S, P, C))
+
+        return tokens, frame_idx, intermediates
+
+    def _process_global_attention(
+        self,
+        tokens,
+        B,
+        S,
+        P,
+        C,
+        global_idx,
+        pos=None,
+        past_key_values_block=None,
+        use_cache=False,
+        past_frame_idx=0
+    ) -> Union[Tuple[torch.Tensor, int, List[torch.Tensor]], Tuple[torch.Tensor, int, List[torch.Tensor], List]]:
+        """
+        Process global attention blocks. We keep tokens in shape (B, S*P, C).
+                """
+        
+        if tokens.shape != (B, S * P, C):
+            tokens = tokens.reshape(B, S, P, C).reshape(B, S * P, C)
+
+        if pos is not None and pos.shape != (B, S * P, 2):
+            pos = pos.reshape(B, S, P, 2).reshape(B, S * P, 2)
+            
+        intermediates = []
+
+        for _ in range(self.aa_block_size):
+            if not use_cache:
+                L = S * P
+                frame_ids = torch.arange(L, device=tokens.device) // P  # [0,0,...,1,1,...,S-1]
+                future_frame = frame_ids.unsqueeze(1) < frame_ids.unsqueeze(0)
+                attn_mask = future_frame.to(tokens.dtype) * torch.finfo(tokens.dtype).min
+            else:
+                attn_mask = None
+                
+            if use_cache:
+                tokens, block_kv = self.global_blocks[global_idx](
+                    tokens, 
+                    pos=pos, 
+                    attn_mask=attn_mask, 
+                    past_key_values=past_key_values_block,
+                    use_cache=True
+                )
+            else:
+                tokens = self._run_block(self.global_blocks[global_idx], tokens, pos=pos, attn_mask=attn_mask)
+            global_idx += 1
+            intermediates.append(tokens.reshape(B, S, P, C))
+
+            # if self.use_causal_global:
+            #     del attn_mask
+        if use_cache:
+            return tokens, global_idx, intermediates, block_kv
+        return tokens, global_idx, intermediates
+
+
+def slice_expand_and_flatten(token_tensor, B, S):
+    """
+    Processes specialized tokens with shape (1, 2, X, C) for multi-frame processing:
+    1) Uses the first position (index=0) for the first frame only
+    2) Uses the second position (index=1) for all remaining frames (S-1 frames)
+    3) Expands both to match batch size B
+    4) Concatenates to form (B, S, X, C) where each sequence has 1 first-position token
+       followed by (S-1) second-position tokens
+    5) Flattens to (B*S, X, C) for processing
+
+    Returns:
+        torch.Tensor: Processed tokens with shape (B*S, X, C)
+    """
+
+    # Slice out the "query" tokens => shape (1, 1, ...)
+    query = token_tensor[:, 0:1, ...].expand(B, 1, *token_tensor.shape[2:])
+    # Slice out the "other" tokens => shape (1, S-1, ...)
+    others = token_tensor[:, 1:, ...].expand(B, S - 1, *token_tensor.shape[2:])
+    # Concatenate => shape (B, S, ...)
+    combined = torch.cat([query, others], dim=1)
+
+    # Finally flatten => shape (B*S, ...)
+    combined = combined.reshape(B * S, *combined.shape[2:])
+    return combined

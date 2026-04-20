@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Model weights & checkpoints
+ckpt/
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Data
+data/
+
+# Logs
+*.log
+wandb/
+runs/
+logs/
+*.tfevents*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*
+
+# Compiled extensions
+*.o
+*.a
+*.dylib

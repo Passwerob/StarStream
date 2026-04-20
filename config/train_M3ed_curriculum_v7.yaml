@@ -1,0 +1,127 @@
+teacher: ../ckpt/model.pt
+pretrained: ../ckpt/model.pt
+load_only_encoder: False
+long_context: False
+fixed_length: True
+resume: Null
+benchmark: False
+fusion: crossattn
+use_event: True
+event_in_chans: 8
+event_patch_size: Null
+inject_interval: 4
+train_dino: False
+dino_lr_scale: 0.05
+# num_views: 15
+num_views: 23
+# num_views_min: 13
+num_views_min: 19
+# num_views_max: 15
+num_views_max: 25
+# num_test_views: 4
+num_test_views: 6
+n_corres_train: 0
+n_corres_test: 0
+allow_repeat: False
+sample_mode: mixed
+sequence_ratio: 0.75
+train_criterion: DistillLoss()
+test_criterion: DistillLoss()
+dataset_sim: DL3DV_ScreenEvent_Multi(
+  allow_repeat=${allow_repeat},
+  split='train',
+  ROOT='/robby/share/MM/datasets/PRFL/dl3dv_processed',
+  resolution=[(518, 392), (518, 336), (518, 294), (518, 266), (518, 210), (518, 154), (392, 518), (336, 518), (294, 518), (266, 518)],
+  transform=SeqColorJitter,
+  num_views=${num_views},
+  min_interval=1,
+  max_interval=3,
+  sample_mode='${sample_mode}',
+  sequence_ratio=${sequence_ratio},
+  event_in_chans=8)
+dataset_real_m3ed: DL3DV_ScreenEvent_Multi(
+  allow_repeat=${allow_repeat},
+  split='train',
+  ROOT='/robby/share/MM/datasets/PRFL/M3edd',
+  resolution=[(518, 392), (518, 336), (518, 294), (518, 266), (518, 210), (518, 154), (392, 518), (336, 518), (294, 518), (266, 518)],
+  transform=SeqColorJitter,
+  num_views=${num_views},
+  min_interval=1,
+  max_interval=3,
+  sample_mode='${sample_mode}',
+  sequence_ratio=${sequence_ratio},
+  event_in_chans=8)
+dataset_real_dsec: DL3DV_ScreenEvent_Multi(
+  allow_repeat=${allow_repeat},
+  split='train',
+  ROOT='/robby/share/MM/datasets/PRFL/DSEC_processed',
+  resolution=[(518, 392), (518, 336), (518, 294), (518, 266), (518, 210), (518, 154), (392, 518), (336, 518), (294, 518), (266, 518)],
+  transform=SeqColorJitter,
+  num_views=${num_views},
+  min_interval=1,
+  max_interval=3,
+  sample_mode='${sample_mode}',
+  sequence_ratio=${sequence_ratio},
+  event_in_chans=8)
+curriculum_total_size: 10000
+curriculum_warmup_epochs: 2
+curriculum_final_ratio_b: 0.8
+curriculum_min_ratio_a: 0.2
+curriculum_initial_ratio_b: 0.0
+train_dataset: CurriculumMixDataset(
+  total_size=${curriculum_total_size},
+  dataset_a=${dataset_sim},
+  dataset_b=${dataset_real_m3ed} + ${dataset_real_dsec},
+  total_epochs=${epochs},
+  warmup_epochs=${curriculum_warmup_epochs},
+  final_ratio_b=${curriculum_final_ratio_b},
+  min_ratio_a=${curriculum_min_ratio_a},
+  initial_ratio_b=${curriculum_initial_ratio_b})
+test_dataset: 500 @ DL3DV_ScreenEvent_Multi(
+  split='train',
+  ROOT='/robby/share/MM/datasets/PRFL/M3edd',
+  resolution=(518, 392),
+  num_views=${num_test_views},
+  seed=42,
+  min_interval=1,
+  max_interval=3,
+  sample_mode='mixed',
+  sequence_ratio=0.5,
+  event_in_chans=8)
+seed: 0
+batch_size: 1
+accum_iter: 1
+gradient_checkpointing: True
+epochs: 10
+start_epoch: 0
+start_step: 0
+weight_decay: 0.05
+lr: 5e-6
+min_lr: 1e-7
+warmup_epochs: 1
+amp: 1
+num_workers: 8
+world_size: 1
+local-rank: -1
+dist_url: 'env://'
+rank: 0
+gpu: 0
+distributed: False
+dist_backend: 'nccl'
+eval_freq: 1
+max_val_batches: 50
+save_freq: 0.1
+max_checkpoints: 10
+keep_freq: 1
+print_freq: 10
+print_img_freq: 50000000
+num_imgs_vis: 4
+save_dir: '../checkpoints'
+exp_name: 'vggt_train_M3ed_curriculum_v7'
+task: 'StreamVGGT'
+logdir: ${save_dir}/${exp_name}/logs
+output_dir: ${save_dir}/${exp_name}/
+hydra:
+  verbose: False
+  run:
+    dir: ${save_dir}/${exp_name}
